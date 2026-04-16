@@ -38,7 +38,13 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Create a `.env` file:
+For local development and test tooling:
+
+```bash
+pip install -r requirements-dev.txt
+```
+
+Create a `.env` file from [.env.example](/Users/abhijithshaji/Documents/GitSecurity/.env.example):
 
 ```env
 GITHUB_TOKEN=your_github_token
@@ -63,6 +69,24 @@ from watchman import build_hunter
 
 hunter = build_hunter()
 hunter.monitor_repository("psf/requests", limit=3)
+```
+
+## CI/CD practices
+
+The repo now includes a basic CI baseline:
+
+- GitHub Actions workflow at [.github/workflows/ci.yml](/Users/abhijithshaji/Documents/GitSecurity/.github/workflows/ci.yml)
+- `ruff` linting
+- Python syntax validation
+- `pytest` unit tests for parsing and SQLite persistence
+- Dependabot config at [.github/dependabot.yml](/Users/abhijithshaji/Documents/GitSecurity/.github/dependabot.yml)
+
+Run the checks locally with:
+
+```bash
+ruff check .
+pytest
+python -m compileall watchman.py testThreat.py tests
 ```
 
 ## Persistence
