@@ -3,7 +3,8 @@ import tempfile
 from pathlib import Path
 
 import watchman
-from watchman import DetectionResult, FindingStore, ThreatHunter
+from testThreat import FAKE_PATCH
+from watchman import DetectionResult, FindingStore, ThreatHunter, load_watchlist
 
 
 def build_test_hunter(tmp_path: Path) -> ThreatHunter:
@@ -34,6 +35,7 @@ def test_parse_detection_payload_coerces_fields(tmp_path: Path) -> None:
             "summary": "Reverse shell behavior detected.",
             "reasons": ["spawns shell", "opens outbound socket"],
             "indicators": ["socket", "/bin/sh"],
+            "rule_hits": ["reverse-shell-pattern"],
             "yara_rule": "rule reverse_shell { condition: true }",
         }
     )
@@ -45,6 +47,16 @@ def test_parse_detection_payload_coerces_fields(tmp_path: Path) -> None:
     assert parsed["summary"] == "Reverse shell behavior detected."
     assert parsed["reasons"] == ["spawns shell", "opens outbound socket"]
     assert parsed["indicators"] == ["socket", "/bin/sh"]
+    assert parsed["rule_hits"] == ["reverse-shell-pattern"]
+
+
+def test_run_prechecks_detects_reverse_shell(tmp_path: Path) -> None:
+    hunter = build_test_hunter(tmp_path)
+    result = hunter.run_prechecks("requests/api.py", FAKE_PATCH)
+
+    assert result.normalized_risk() == "high"
+    assert "reverse-shell-pattern" in result.rule_hits
+    assert "/bin/sh" in result.indicators
 
 
 def test_finding_store_saves_commit_and_finding(tmp_path: Path) -> None:
@@ -64,6 +76,7 @@ def test_finding_store_saves_commit_and_finding(tmp_path: Path) -> None:
         indicators=["subprocess", "/bin/sh"],
         yara_rule="rule suspicious_shell { condition: true }",
         raw_response='{"risk":"medium"}',
+        rule_hits=["shell-spawn"],
     )
 
     store.save_finding("abc123", "requests/api.py", result)
@@ -71,7 +84,7 @@ def test_finding_store_saves_commit_and_finding(tmp_path: Path) -> None:
     with store._connect() as connection:
         commit = connection.execute("SELECT repo_name, commit_sha FROM commits").fetchone()
         finding = connection.execute(
-            "SELECT file_name, risk, confidence, summary FROM findings"
+            "SELECT file_name, risk, confidence, summary, rule_hits_json FROM findings"
         ).fetchone()
 
     assert commit["repo_name"] == "psf/requests"
@@ -79,6 +92,7 @@ def test_finding_store_saves_commit_and_finding(tmp_path: Path) -> None:
     assert finding["file_name"] == "requests/api.py"
     assert finding["risk"] == "medium"
     assert finding["confidence"] == 77
+    assert json.loads(finding["rule_hits_json"]) == ["shell-spawn"]
 
 
 def test_save_yara_rule_creates_file(tmp_path: Path) -> None:
@@ -97,3 +111,15 @@ def test_save_yara_rule_creates_file(tmp_path: Path) -> None:
             assert "requests_api.py" in yara_path.name
         finally:
             watchman.SIGNATURES_DIR = original_path
+
+
+def test_load_watchlist_ignores_comments_and_blank_lines(tmp_path: Path) -> None:
+    watchlist_path = tmp_path / "watchlist.txt"
+    watchlist_path.write_text(
+        "# monitored repos\npsf/requests\n\npallets/flask\n",
+        encoding="utf-8",
+    )
+
+    repos = load_watchlist(watchlist_path)
+
+    assert repos == ["psf/requests", "pallets/flask"]

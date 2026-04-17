@@ -1,10 +1,11 @@
+import argparse
 import json
 import os
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from dotenv import load_dotenv
 from github import Auth, Github
@@ -19,6 +20,10 @@ DEFAULT_TARGET_REPO = os.getenv("TARGET_REPO", "psf/requests")
 DATABASE_PATH = Path(os.getenv("WATCHMAN_DB_PATH", "security_findings.db"))
 SIGNATURES_DIR = Path("signatures")
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+WATCHLIST_PATH = Path(os.getenv("WATCHLIST_PATH", "watchlist.txt"))
+DEFAULT_SCAN_LIMIT = int(os.getenv("WATCHMAN_SCAN_LIMIT", "3"))
+
+RISK_ORDER = {"unknown": 0, "low": 1, "medium": 2, "high": 3}
 
 
 @dataclass
@@ -30,6 +35,7 @@ class DetectionResult:
     indicators: List[str] = field(default_factory=list)
     yara_rule: Optional[str] = None
     raw_response: str = ""
+    rule_hits: List[str] = field(default_factory=list)
 
     def normalized_risk(self) -> str:
         value = (self.risk or "").strip().lower()
@@ -41,6 +47,15 @@ class DetectionResult:
 
     def should_save_yara(self) -> bool:
         return self.normalized_risk() in {"high", "medium"} and bool(self.yara_rule)
+
+
+@dataclass
+class RuleSignal:
+    rule_id: str
+    risk: str
+    confidence: int
+    reason: str
+    indicators: List[str] = field(default_factory=list)
 
 
 class FindingStore:
@@ -83,6 +98,28 @@ class FindingStore:
                     FOREIGN KEY(commit_sha) REFERENCES commits(commit_sha)
                 );
                 """
+            )
+            self._ensure_column(
+                connection,
+                table_name="findings",
+                column_name="rule_hits_json",
+                column_sql="TEXT NOT NULL DEFAULT '[]'",
+            )
+
+    @staticmethod
+    def _ensure_column(
+        connection: sqlite3.Connection,
+        table_name: str,
+        column_name: str,
+        column_sql: str,
+    ) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+        }
+        if column_name not in columns:
+            connection.execute(
+                f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}"
             )
 
     def commit_exists(self, commit_sha: str) -> bool:
@@ -135,9 +172,10 @@ class FindingStore:
                     indicators_json,
                     yara_rule,
                     raw_response,
-                    created_at
+                    created_at,
+                    rule_hits_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     commit_sha,
@@ -150,30 +188,94 @@ class FindingStore:
                     result.yara_rule,
                     result.raw_response,
                     created_at,
+                    json.dumps(result.rule_hits),
                 ),
             )
+
+    def list_findings(
+        self,
+        limit: int = 20,
+        risk: Optional[str] = None,
+        repo_name: Optional[str] = None,
+    ) -> List[sqlite3.Row]:
+        query = """
+            SELECT
+                findings.id,
+                commits.repo_name,
+                findings.commit_sha,
+                findings.file_name,
+                findings.risk,
+                findings.confidence,
+                findings.summary,
+                findings.created_at,
+                findings.rule_hits_json
+            FROM findings
+            JOIN commits ON findings.commit_sha = commits.commit_sha
+        """
+        filters: List[str] = []
+        params: List[Any] = []
+
+        if risk:
+            filters.append("findings.risk = ?")
+            params.append(risk.lower())
+        if repo_name:
+            filters.append("commits.repo_name = ?")
+            params.append(repo_name)
+
+        if filters:
+            query += " WHERE " + " AND ".join(filters)
+
+        query += " ORDER BY findings.created_at DESC, findings.id DESC LIMIT ?"
+        params.append(limit)
+
+        with self._connect() as connection:
+            return connection.execute(query, params).fetchall()
+
+    def get_finding(self, finding_id: int) -> Optional[sqlite3.Row]:
+        query = """
+            SELECT
+                findings.id,
+                commits.repo_name,
+                findings.commit_sha,
+                commits.author_name,
+                commits.commit_message,
+                commits.html_url,
+                findings.file_name,
+                findings.risk,
+                findings.confidence,
+                findings.summary,
+                findings.reasons_json,
+                findings.indicators_json,
+                findings.yara_rule,
+                findings.rule_hits_json,
+                findings.raw_response,
+                findings.created_at
+            FROM findings
+            JOIN commits ON findings.commit_sha = commits.commit_sha
+            WHERE findings.id = ?
+        """
+        with self._connect() as connection:
+            return connection.execute(query, (finding_id,)).fetchone()
 
 
 class ThreatHunter:
     def __init__(
         self,
-        github_token: str,
-        openai_api_key: str,
+        github_token: Optional[str],
+        openai_api_key: Optional[str],
         db_path: Path = DATABASE_PATH,
         model: str = DEFAULT_MODEL,
     ) -> None:
-        if not github_token:
-            raise ValueError("Missing GITHUB_TOKEN.")
-        if not openai_api_key:
-            raise ValueError("Missing OPENAI_API_KEY.")
-
-        self.github = Github(auth=Auth.Token(github_token))
-        self.client = OpenAI(api_key=openai_api_key)
+        self.github = Github(auth=Auth.Token(github_token)) if github_token else None
+        self.client = OpenAI(api_key=openai_api_key) if openai_api_key else None
         self.store = FindingStore(db_path)
         self.model = model
         SIGNATURES_DIR.mkdir(parents=True, exist_ok=True)
 
     def monitor_repository(self, repo_name: str, limit: int = 3, skip_existing: bool = True) -> None:
+        if not self.github:
+            raise ValueError("Missing GITHUB_TOKEN. Required for repository scanning.")
+
         repo = self.github.get_repo(repo_name)
         commits = repo.get_commits()
 
@@ -221,6 +323,10 @@ class ThreatHunter:
     def analyze_patch(self, filename: str, patch_data: str, commit_sha: str = "test") -> DetectionResult:
         print("    ... Auditing for threats ...")
 
+        rule_result = self.run_prechecks(filename, patch_data)
+        if not self.client:
+            return rule_result
+
         user_prompt = f"""
 Analyze this GitHub patch for malicious or suspicious activity.
 
@@ -231,6 +337,15 @@ Return valid JSON with exactly these keys:
 - reasons: array of concise detection reasons
 - indicators: array of suspicious APIs, IOCs, behaviors, or artifacts
 - yara_rule: full YARA rule string if risk is high or medium, otherwise null
+
+Deterministic rule signals already observed:
+{json.dumps({
+    "risk": rule_result.normalized_risk(),
+    "confidence": rule_result.confidence,
+    "rule_hits": rule_result.rule_hits,
+    "reasons": rule_result.reasons,
+    "indicators": rule_result.indicators,
+})}
 
 Only output JSON.
 
@@ -259,7 +374,123 @@ PATCH:
         raw_response = response.choices[0].message.content or "{}"
         payload = self._parse_detection_payload(raw_response)
         payload["raw_response"] = raw_response
-        return DetectionResult(**payload)
+        llm_result = DetectionResult(**payload)
+        return self.merge_results(rule_result, llm_result)
+
+    def run_prechecks(self, filename: str, patch_data: str) -> DetectionResult:
+        lower_patch = patch_data.lower()
+        signals: List[RuleSignal] = []
+
+        if all(token in lower_patch for token in ("socket", "dup2", "/bin/sh")):
+            signals.append(
+                RuleSignal(
+                    rule_id="reverse-shell-pattern",
+                    risk="high",
+                    confidence=96,
+                    reason="Patch combines socket redirection with an interactive shell.",
+                    indicators=["socket", "dup2", "/bin/sh"],
+                )
+            )
+
+        if "subprocess" in lower_patch and any(token in lower_patch for token in ("/bin/sh", "cmd.exe", "powershell")):
+            signals.append(
+                RuleSignal(
+                    rule_id="shell-spawn",
+                    risk="high",
+                    confidence=88,
+                    reason="Patch launches a shell through subprocess execution.",
+                    indicators=["subprocess", "/bin/sh", "powershell", "cmd.exe"],
+                )
+            )
+
+        if any(token in lower_patch for token in ("curl ", "wget ", "invoke-webrequest", "requests.get(")) and any(
+            token in lower_patch for token in ("exec(", "eval(", "subprocess", "os.system(")
+        ):
+            signals.append(
+                RuleSignal(
+                    rule_id="download-and-execute",
+                    risk="high",
+                    confidence=90,
+                    reason="Patch downloads remote content and executes it.",
+                    indicators=["curl", "wget", "requests.get", "exec", "subprocess"],
+                )
+            )
+
+        if "base64" in lower_patch and any(token in lower_patch for token in ("exec(", "eval(", "powershell -enc")):
+            signals.append(
+                RuleSignal(
+                    rule_id="encoded-execution",
+                    risk="medium",
+                    confidence=78,
+                    reason="Patch appears to decode or run an encoded payload.",
+                    indicators=["base64", "exec", "eval", "powershell -enc"],
+                )
+            )
+
+        if any(token in lower_patch for token in ("openai_api_key", "github_token", "aws_secret_access_key")):
+            signals.append(
+                RuleSignal(
+                    rule_id="secret-access-pattern",
+                    risk="medium",
+                    confidence=65,
+                    reason="Patch references sensitive credential material directly.",
+                    indicators=["openai_api_key", "github_token", "aws_secret_access_key"],
+                )
+            )
+
+        if not signals:
+            return DetectionResult(
+                risk="low",
+                confidence=20,
+                summary=f"No deterministic rule hits for {filename}.",
+                reasons=["No high-signal behavioral matches were detected by local rules."],
+                indicators=[],
+                rule_hits=[],
+                raw_response="",
+            )
+
+        strongest_signal = max(signals, key=lambda signal: (RISK_ORDER[signal.risk], signal.confidence))
+        reasons = self._unique_preserve_order(signal.reason for signal in signals)
+        indicators = self._unique_preserve_order(
+            indicator
+            for signal in signals
+            for indicator in signal.indicators
+            if indicator in lower_patch
+        )
+
+        summary = (
+            f"Deterministic prechecks flagged {filename} with "
+            f"{strongest_signal.risk} risk via {', '.join(signal.rule_id for signal in signals)}."
+        )
+        return DetectionResult(
+            risk=strongest_signal.risk,
+            confidence=strongest_signal.confidence,
+            summary=summary,
+            reasons=reasons,
+            indicators=indicators,
+            rule_hits=[signal.rule_id for signal in signals],
+            raw_response="",
+        )
+
+    @staticmethod
+    def merge_results(rule_result: DetectionResult, llm_result: DetectionResult) -> DetectionResult:
+        final_result = llm_result if RISK_ORDER[llm_result.normalized_risk()] >= RISK_ORDER[rule_result.normalized_risk()] else rule_result
+        merged_summary = llm_result.summary or rule_result.summary
+        if rule_result.rule_hits:
+            merged_summary = (
+                f"{merged_summary} Rule hits: {', '.join(rule_result.rule_hits)}."
+            )
+
+        return DetectionResult(
+            risk=final_result.normalized_risk(),
+            confidence=max(rule_result.confidence, llm_result.confidence),
+            summary=merged_summary,
+            reasons=ThreatHunter._unique_preserve_order(rule_result.reasons + llm_result.reasons),
+            indicators=ThreatHunter._unique_preserve_order(rule_result.indicators + llm_result.indicators),
+            yara_rule=llm_result.yara_rule or rule_result.yara_rule,
+            raw_response=llm_result.raw_response,
+            rule_hits=ThreatHunter._unique_preserve_order(rule_result.rule_hits + llm_result.rule_hits),
+        )
 
     def save_yara_rule(self, rule_text: str, commit_sha: str, filename: str) -> Path:
         sanitized_name = filename.replace("/", "_").replace("\\", "_")
@@ -278,6 +509,7 @@ PATCH:
         summary = str(payload.get("summary", "")).strip() or "No summary returned."
         reasons = self._coerce_list(payload.get("reasons"))
         indicators = self._coerce_list(payload.get("indicators"))
+        rule_hits = self._coerce_list(payload.get("rule_hits"))
         yara_rule = payload.get("yara_rule")
 
         if yara_rule is not None:
@@ -290,6 +522,7 @@ PATCH:
             "reasons": reasons,
             "indicators": indicators,
             "yara_rule": yara_rule,
+            "rule_hits": rule_hits,
         }
 
     @staticmethod
@@ -307,40 +540,192 @@ PATCH:
         return []
 
     @staticmethod
+    def _unique_preserve_order(values: Iterable[str]) -> List[str]:
+        seen = set()
+        items: List[str] = []
+        for value in values:
+            cleaned = str(value).strip()
+            if not cleaned or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            items.append(cleaned)
+        return items
+
+    @staticmethod
     def _print_result(result: DetectionResult) -> None:
         print("    [SECURITY REPORT]")
         print(f"    Risk: {result.normalized_risk()} ({result.confidence}% confidence)")
         print(f"    Summary: {result.summary}")
+        if result.rule_hits:
+            print(f"    Rule Hits: {', '.join(result.rule_hits)}")
         if result.reasons:
             print(f"    Reasons: {', '.join(result.reasons)}")
         if result.indicators:
             print(f"    Indicators: {', '.join(result.indicators)}")
 
 
+def load_watchlist(path: Path = WATCHLIST_PATH) -> List[str]:
+    env_repos = os.getenv("WATCHLIST_REPOS")
+    if env_repos:
+        return [repo.strip() for repo in env_repos.split(",") if repo.strip()]
+
+    if not path.exists():
+        return []
+
+    repos: List[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        cleaned = line.strip()
+        if not cleaned or cleaned.startswith("#"):
+            continue
+        repos.append(cleaned)
+    return repos
+
+
+def print_findings_table(rows: List[sqlite3.Row]) -> None:
+    if not rows:
+        print("No findings matched the current filters.")
+        return
+
+    for row in rows:
+        rule_hits = json.loads(row["rule_hits_json"] or "[]")
+        print(
+            f"[{row['id']}] {row['risk'].upper():<6} {row['confidence']:>3}% "
+            f"{row['repo_name']} {row['commit_sha'][:7]} {row['file_name']}"
+        )
+        print(f"      {row['summary']}")
+        if rule_hits:
+            print(f"      Rule hits: {', '.join(rule_hits)}")
+
+
+def print_finding_detail(row: Optional[sqlite3.Row]) -> None:
+    if row is None:
+        print("Finding not found.")
+        return
+
+    reasons = json.loads(row["reasons_json"] or "[]")
+    indicators = json.loads(row["indicators_json"] or "[]")
+    rule_hits = json.loads(row["rule_hits_json"] or "[]")
+
+    print(f"Finding #{row['id']}")
+    print(f"Repo: {row['repo_name']}")
+    print(f"Commit: {row['commit_sha']}")
+    print(f"Author: {row['author_name']}")
+    print(f"Message: {row['commit_message']}")
+    print(f"File: {row['file_name']}")
+    print(f"Risk: {row['risk']} ({row['confidence']}% confidence)")
+    print(f"Created: {row['created_at']}")
+    if row["html_url"]:
+        print(f"URL: {row['html_url']}")
+    print(f"Summary: {row['summary']}")
+    if rule_hits:
+        print(f"Rule hits: {', '.join(rule_hits)}")
+    if reasons:
+        print(f"Reasons: {', '.join(reasons)}")
+    if indicators:
+        print(f"Indicators: {', '.join(indicators)}")
+    if row["yara_rule"]:
+        print("YARA:")
+        print(row["yara_rule"])
+
+
 def build_hunter() -> ThreatHunter:
     return ThreatHunter(
-        github_token=GITHUB_TOKEN or "",
-        openai_api_key=OPENAI_API_KEY or "",
+        github_token=GITHUB_TOKEN,
+        openai_api_key=OPENAI_API_KEY,
         db_path=DATABASE_PATH,
         model=DEFAULT_MODEL,
     )
 
 
-if __name__ == "__main__":
-    hunter = build_hunter()
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="LLM-powered GitHub commit threat hunter")
+    subparsers = parser.add_subparsers(dest="command", required=True)
 
-    from testThreat import FAKE_PATCH
-
-    result = hunter.analyze_patch("requests/api.py", FAKE_PATCH, commit_sha="reverse_shell_001")
-    hunter.store.save_commit_metadata(
-        repo_name=DEFAULT_TARGET_REPO,
-        commit_sha="reverse_shell_001",
-        author_name="local-test",
-        commit_message="Synthetic reverse shell patch",
-        html_url=None,
+    scan_parser = subparsers.add_parser("scan", help="Scan a single repository")
+    scan_parser.add_argument("--repo", default=DEFAULT_TARGET_REPO, help="GitHub repo in owner/name format")
+    scan_parser.add_argument("--limit", type=int, default=DEFAULT_SCAN_LIMIT, help="Number of recent commits to scan")
+    scan_parser.add_argument(
+        "--include-existing",
+        action="store_true",
+        help="Re-scan commits even if they already exist in the local database",
     )
-    hunter.store.save_finding("reverse_shell_001", "requests/api.py", result)
-    hunter._print_result(result)
-    if result.should_save_yara():
-        yara_path = hunter.save_yara_rule(result.yara_rule or "", "reverse_shell_001", "requests/api.py")
-        print(f"Saved YARA rule to {yara_path}")
+
+    watchlist_parser = subparsers.add_parser("scan-watchlist", help="Scan repositories from the watchlist")
+    watchlist_parser.add_argument("--watchlist", type=Path, default=WATCHLIST_PATH, help="Path to watchlist file")
+    watchlist_parser.add_argument("--limit", type=int, default=DEFAULT_SCAN_LIMIT, help="Number of recent commits per repo")
+    watchlist_parser.add_argument(
+        "--include-existing",
+        action="store_true",
+        help="Re-scan commits even if they already exist in the local database",
+    )
+
+    list_parser = subparsers.add_parser("list-findings", help="List stored findings")
+    list_parser.add_argument("--limit", type=int, default=20, help="Maximum findings to display")
+    list_parser.add_argument("--risk", choices=["high", "medium", "low"], help="Filter by risk level")
+    list_parser.add_argument("--repo", help="Filter by repository name")
+
+    show_parser = subparsers.add_parser("show-finding", help="Show a finding in detail")
+    show_parser.add_argument("finding_id", type=int, help="Finding identifier")
+
+    test_parser = subparsers.add_parser("test", help="Run the synthetic local threat test")
+    test_parser.add_argument("--filename", default="requests/api.py", help="Logical filename for the synthetic patch")
+    test_parser.add_argument("--commit-sha", default="reverse_shell_001", help="Synthetic commit identifier")
+
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.command in {"scan", "scan-watchlist", "test"}:
+        hunter = build_hunter()
+    else:
+        store = FindingStore(DATABASE_PATH)
+
+    if args.command == "scan":
+        hunter.monitor_repository(args.repo, limit=args.limit, skip_existing=not args.include_existing)
+        return
+
+    if args.command == "scan-watchlist":
+        repos = load_watchlist(args.watchlist)
+        if not repos:
+            print(f"No repositories found in watchlist: {args.watchlist}")
+            return
+        for repo_name in repos:
+            hunter.monitor_repository(repo_name, limit=args.limit, skip_existing=not args.include_existing)
+        return
+
+    if args.command == "list-findings":
+        print_findings_table(
+            store.list_findings(limit=args.limit, risk=args.risk, repo_name=args.repo)
+        )
+        return
+
+    if args.command == "show-finding":
+        print_finding_detail(store.get_finding(args.finding_id))
+        return
+
+    if args.command == "test":
+        from testThreat import FAKE_PATCH
+
+        result = hunter.analyze_patch(args.filename, FAKE_PATCH, commit_sha=args.commit_sha)
+        hunter.store.save_commit_metadata(
+            repo_name=DEFAULT_TARGET_REPO,
+            commit_sha=args.commit_sha,
+            author_name="local-test",
+            commit_message="Synthetic reverse shell patch",
+            html_url=None,
+        )
+        hunter.store.save_finding(args.commit_sha, args.filename, result)
+        hunter._print_result(result)
+        if result.should_save_yara():
+            yara_path = hunter.save_yara_rule(result.yara_rule or "", args.commit_sha, args.filename)
+            print(f"Saved YARA rule to {yara_path}")
+        return
+
+    parser.error(f"Unsupported command: {args.command}")
+
+
+if __name__ == "__main__":
+    main()
