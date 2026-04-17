@@ -25,6 +25,7 @@ Each file-level finding is normalized into:
 
 - [watchman.py](/Users/abhijithshaji/Documents/GitSecurity/watchman.py): main scanner, detection parsing, and SQLite persistence
 - [testThreat.py](/Users/abhijithshaji/Documents/GitSecurity/testThreat.py): synthetic malicious patch for local testing
+- [watchlist.txt.example](/Users/abhijithshaji/Documents/GitSecurity/watchlist.txt.example): starter watchlist for multi-repo scans
 - `security_findings.db`: generated SQLite database
 - `signatures/`: generated YARA signatures
 
@@ -52,6 +53,7 @@ OPENAI_API_KEY=your_openai_api_key
 TARGET_REPO=psf/requests
 OPENAI_MODEL=gpt-4o
 WATCHMAN_DB_PATH=security_findings.db
+WATCHLIST_PATH=watchlist.txt
 ```
 
 ## Usage
@@ -59,16 +61,26 @@ WATCHMAN_DB_PATH=security_findings.db
 Run the local synthetic test flow:
 
 ```bash
-python3 watchman.py
+python3 watchman.py test
 ```
 
-Run repository monitoring from Python:
+Scan a single repository:
 
-```python
-from watchman import build_hunter
+```bash
+python3 watchman.py scan --repo psf/requests --limit 3
+```
 
-hunter = build_hunter()
-hunter.monitor_repository("psf/requests", limit=3)
+Copy [watchlist.txt.example](/Users/abhijithshaji/Documents/GitSecurity/watchlist.txt.example) to `watchlist.txt`, then scan all watched repos:
+
+```bash
+python3 watchman.py scan-watchlist --limit 3
+```
+
+Review saved findings from the local database:
+
+```bash
+python3 watchman.py list-findings --risk high
+python3 watchman.py show-finding 1
 ```
 
 ## CI/CD practices
@@ -94,6 +106,15 @@ python -m compileall watchman.py testThreat.py tests
 Findings are stored in SQLite across two tables:
 
 - `commits`: repo, commit SHA, author, message, URL, analysis timestamp
-- `findings`: file name, risk, confidence, summary, reasons, indicators, YARA, raw model response
+- `findings`: file name, risk, confidence, summary, reasons, indicators, rule hits, YARA, raw model response
 
 This makes it much easier to build a dashboard, alerting workflow, or evaluation pipeline on top of the scanner.
+
+## v0.2 additions
+
+This version adds a few product-oriented building blocks:
+
+- multi-repo watchlist support
+- deterministic prechecks before the LLM runs
+- CLI commands for scanning and reviewing findings
+- persisted rule hits so local heuristics are auditable later
