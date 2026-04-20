@@ -81,6 +81,8 @@ Review saved findings from the local database:
 ```bash
 python3 watchman.py list-findings --risk high
 python3 watchman.py show-finding 1
+python3 watchman.py triage-finding 1 --disposition true_positive --note "Confirmed reverse shell behavior"
+python3 watchman.py list-findings --disposition new
 ```
 
 ## CI/CD practices
@@ -106,7 +108,7 @@ python -m compileall watchman.py testThreat.py tests
 Findings are stored in SQLite across two tables:
 
 - `commits`: repo, commit SHA, author, message, URL, analysis timestamp
-- `findings`: file name, risk, confidence, summary, reasons, indicators, rule hits, YARA, raw model response
+- `findings`: file name, risk, confidence, summary, reasons, indicators, rule hits, YARA, raw model response, disposition, analyst note, triage timestamp
 
 This makes it much easier to build a dashboard, alerting workflow, or evaluation pipeline on top of the scanner.
 
@@ -118,3 +120,4 @@ This version adds a few product-oriented building blocks:
 - deterministic prechecks before the LLM runs
 - CLI commands for scanning and reviewing findings
 - persisted rule hits so local heuristics are auditable later
+- analyst triage workflow with dispositions and notes
