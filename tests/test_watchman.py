@@ -84,7 +84,7 @@ def test_finding_store_saves_commit_and_finding(tmp_path: Path) -> None:
     with store._connect() as connection:
         commit = connection.execute("SELECT repo_name, commit_sha FROM commits").fetchone()
         finding = connection.execute(
-            "SELECT file_name, risk, confidence, summary, rule_hits_json FROM findings"
+            "SELECT file_name, risk, confidence, summary, rule_hits_json, disposition, analyst_note FROM findings"
         ).fetchone()
 
     assert commit["repo_name"] == "psf/requests"
@@ -93,6 +93,8 @@ def test_finding_store_saves_commit_and_finding(tmp_path: Path) -> None:
     assert finding["risk"] == "medium"
     assert finding["confidence"] == 77
     assert json.loads(finding["rule_hits_json"]) == ["shell-spawn"]
+    assert finding["disposition"] == "new"
+    assert finding["analyst_note"] == ""
 
 
 def test_save_yara_rule_creates_file(tmp_path: Path) -> None:
@@ -123,3 +125,39 @@ def test_load_watchlist_ignores_comments_and_blank_lines(tmp_path: Path) -> None
     repos = load_watchlist(watchlist_path)
 
     assert repos == ["psf/requests", "pallets/flask"]
+
+
+def test_update_finding_triage_sets_disposition_and_note(tmp_path: Path) -> None:
+    store = FindingStore(tmp_path / "findings.db")
+    store.save_commit_metadata(
+        repo_name="psf/requests",
+        commit_sha="abc124",
+        author_name="alice",
+        commit_message="another suspicious change",
+        html_url="https://example.com/commit/abc124",
+    )
+    store.save_finding(
+        "abc124",
+        "requests/api.py",
+        DetectionResult(
+            risk="high",
+            confidence=92,
+            summary="High-risk shell execution.",
+            reasons=["launches shell"],
+            indicators=["subprocess", "/bin/sh"],
+            rule_hits=["shell-spawn"],
+        ),
+    )
+
+    updated = store.update_finding_triage(
+        1,
+        disposition="true_positive",
+        analyst_note="Confirmed reverse shell behavior.",
+    )
+
+    assert updated is True
+    row = store.get_finding(1)
+    assert row is not None
+    assert row["disposition"] == "true_positive"
+    assert row["analyst_note"] == "Confirmed reverse shell behavior."
+    assert row["triaged_at"] is not None

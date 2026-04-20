@@ -22,6 +22,7 @@ SIGNATURES_DIR = Path("signatures")
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 WATCHLIST_PATH = Path(os.getenv("WATCHLIST_PATH", "watchlist.txt"))
 DEFAULT_SCAN_LIMIT = int(os.getenv("WATCHMAN_SCAN_LIMIT", "3"))
+VALID_DISPOSITIONS = {"new", "true_positive", "false_positive", "ignored"}
 
 RISK_ORDER = {"unknown": 0, "low": 1, "medium": 2, "high": 3}
 
@@ -105,6 +106,24 @@ class FindingStore:
                 column_name="rule_hits_json",
                 column_sql="TEXT NOT NULL DEFAULT '[]'",
             )
+            self._ensure_column(
+                connection,
+                table_name="findings",
+                column_name="disposition",
+                column_sql="TEXT NOT NULL DEFAULT 'new'",
+            )
+            self._ensure_column(
+                connection,
+                table_name="findings",
+                column_name="analyst_note",
+                column_sql="TEXT NOT NULL DEFAULT ''",
+            )
+            self._ensure_column(
+                connection,
+                table_name="findings",
+                column_name="triaged_at",
+                column_sql="TEXT",
+            )
 
     @staticmethod
     def _ensure_column(
@@ -118,9 +137,13 @@ class FindingStore:
             for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
         }
         if column_name not in columns:
-            connection.execute(
-                f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}"
-            )
+            try:
+                connection.execute(
+                    f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}"
+                )
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
 
     def commit_exists(self, commit_sha: str) -> bool:
         with self._connect() as connection:
@@ -173,9 +196,12 @@ class FindingStore:
                     yara_rule,
                     raw_response,
                     created_at,
-                    rule_hits_json
+                    rule_hits_json,
+                    disposition,
+                    analyst_note,
+                    triaged_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     commit_sha,
@@ -189,6 +215,9 @@ class FindingStore:
                     result.raw_response,
                     created_at,
                     json.dumps(result.rule_hits),
+                    "new",
+                    "",
+                    None,
                 ),
             )
 
@@ -197,6 +226,7 @@ class FindingStore:
         limit: int = 20,
         risk: Optional[str] = None,
         repo_name: Optional[str] = None,
+        disposition: Optional[str] = None,
     ) -> List[sqlite3.Row]:
         query = """
             SELECT
@@ -208,7 +238,8 @@ class FindingStore:
                 findings.confidence,
                 findings.summary,
                 findings.created_at,
-                findings.rule_hits_json
+                findings.rule_hits_json,
+                findings.disposition
             FROM findings
             JOIN commits ON findings.commit_sha = commits.commit_sha
         """
@@ -221,6 +252,9 @@ class FindingStore:
         if repo_name:
             filters.append("commits.repo_name = ?")
             params.append(repo_name)
+        if disposition:
+            filters.append("findings.disposition = ?")
+            params.append(disposition)
 
         if filters:
             query += " WHERE " + " AND ".join(filters)
@@ -249,13 +283,57 @@ class FindingStore:
                 findings.yara_rule,
                 findings.rule_hits_json,
                 findings.raw_response,
-                findings.created_at
+                findings.created_at,
+                findings.disposition,
+                findings.analyst_note,
+                findings.triaged_at
             FROM findings
             JOIN commits ON findings.commit_sha = commits.commit_sha
             WHERE findings.id = ?
         """
         with self._connect() as connection:
             return connection.execute(query, (finding_id,)).fetchone()
+
+    def update_finding_triage(
+        self,
+        finding_id: int,
+        disposition: str,
+        analyst_note: Optional[str] = None,
+        clear_note: bool = False,
+    ) -> bool:
+        normalized = disposition.strip().lower()
+        if normalized not in VALID_DISPOSITIONS:
+            raise ValueError(f"Invalid disposition: {disposition}")
+
+        with self._connect() as connection:
+            current = connection.execute(
+                "SELECT analyst_note FROM findings WHERE id = ?",
+                (finding_id,),
+            ).fetchone()
+            if current is None:
+                return False
+
+            if clear_note:
+                note_value = ""
+            elif analyst_note is None:
+                note_value = current["analyst_note"]
+            else:
+                note_value = analyst_note.strip()
+
+            connection.execute(
+                """
+                UPDATE findings
+                SET disposition = ?, analyst_note = ?, triaged_at = ?
+                WHERE id = ?
+                """,
+                (
+                    normalized,
+                    note_value,
+                    datetime.now(timezone.utc).isoformat(),
+                    finding_id,
+                ),
+            )
+        return True
 
 
 class ThreatHunter:
@@ -590,6 +668,7 @@ def print_findings_table(rows: List[sqlite3.Row]) -> None:
         rule_hits = json.loads(row["rule_hits_json"] or "[]")
         print(
             f"[{row['id']}] {row['risk'].upper():<6} {row['confidence']:>3}% "
+            f"{row['disposition']:<14} "
             f"{row['repo_name']} {row['commit_sha'][:7]} {row['file_name']}"
         )
         print(f"      {row['summary']}")
@@ -613,10 +692,15 @@ def print_finding_detail(row: Optional[sqlite3.Row]) -> None:
     print(f"Message: {row['commit_message']}")
     print(f"File: {row['file_name']}")
     print(f"Risk: {row['risk']} ({row['confidence']}% confidence)")
+    print(f"Disposition: {row['disposition']}")
     print(f"Created: {row['created_at']}")
+    if row["triaged_at"]:
+        print(f"Triaged: {row['triaged_at']}")
     if row["html_url"]:
         print(f"URL: {row['html_url']}")
     print(f"Summary: {row['summary']}")
+    if row["analyst_note"]:
+        print(f"Analyst Note: {row['analyst_note']}")
     if rule_hits:
         print(f"Rule hits: {', '.join(rule_hits)}")
     if reasons:
@@ -663,9 +747,25 @@ def build_parser() -> argparse.ArgumentParser:
     list_parser.add_argument("--limit", type=int, default=20, help="Maximum findings to display")
     list_parser.add_argument("--risk", choices=["high", "medium", "low"], help="Filter by risk level")
     list_parser.add_argument("--repo", help="Filter by repository name")
+    list_parser.add_argument("--disposition", choices=sorted(VALID_DISPOSITIONS), help="Filter by disposition")
 
     show_parser = subparsers.add_parser("show-finding", help="Show a finding in detail")
     show_parser.add_argument("finding_id", type=int, help="Finding identifier")
+
+    triage_parser = subparsers.add_parser("triage-finding", help="Update finding disposition and analyst note")
+    triage_parser.add_argument("finding_id", type=int, help="Finding identifier")
+    triage_parser.add_argument(
+        "--disposition",
+        required=True,
+        choices=sorted(VALID_DISPOSITIONS),
+        help="Analyst disposition for the finding",
+    )
+    triage_parser.add_argument("--note", help="Optional analyst note to attach to the finding")
+    triage_parser.add_argument(
+        "--clear-note",
+        action="store_true",
+        help="Clear any existing analyst note",
+    )
 
     test_parser = subparsers.add_parser("test", help="Run the synthetic local threat test")
     test_parser.add_argument("--filename", default="requests/api.py", help="Logical filename for the synthetic patch")
@@ -698,12 +798,36 @@ def main() -> None:
 
     if args.command == "list-findings":
         print_findings_table(
-            store.list_findings(limit=args.limit, risk=args.risk, repo_name=args.repo)
+            store.list_findings(
+                limit=args.limit,
+                risk=args.risk,
+                repo_name=args.repo,
+                disposition=args.disposition,
+            )
         )
         return
 
     if args.command == "show-finding":
         print_finding_detail(store.get_finding(args.finding_id))
+        return
+
+    if args.command == "triage-finding":
+        updated = store.update_finding_triage(
+            args.finding_id,
+            disposition=args.disposition,
+            analyst_note=args.note,
+            clear_note=args.clear_note,
+        )
+        if not updated:
+            print("Finding not found.")
+            return
+        print(
+            f"Updated finding {args.finding_id} to disposition '{args.disposition}'."
+        )
+        if args.note is not None:
+            print("Analyst note updated.")
+        elif args.clear_note:
+            print("Analyst note cleared.")
         return
 
     if args.command == "test":
