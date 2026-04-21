@@ -37,6 +37,7 @@ class DetectionResult:
     yara_rule: Optional[str] = None
     raw_response: str = ""
     rule_hits: List[str] = field(default_factory=list)
+    history_context: Dict[str, Any] = field(default_factory=dict)
 
     def normalized_risk(self) -> str:
         value = (self.risk or "").strip().lower()
@@ -124,6 +125,12 @@ class FindingStore:
                 column_name="triaged_at",
                 column_sql="TEXT",
             )
+            self._ensure_column(
+                connection,
+                table_name="findings",
+                column_name="history_context_json",
+                column_sql="TEXT NOT NULL DEFAULT '{}'",
+            )
 
     @staticmethod
     def _ensure_column(
@@ -199,9 +206,10 @@ class FindingStore:
                     rule_hits_json,
                     disposition,
                     analyst_note,
-                    triaged_at
+                    triaged_at,
+                    history_context_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     commit_sha,
@@ -218,6 +226,7 @@ class FindingStore:
                     "new",
                     "",
                     None,
+                    json.dumps(result.history_context),
                 ),
             )
 
@@ -239,7 +248,8 @@ class FindingStore:
                 findings.summary,
                 findings.created_at,
                 findings.rule_hits_json,
-                findings.disposition
+                findings.disposition,
+                findings.history_context_json
             FROM findings
             JOIN commits ON findings.commit_sha = commits.commit_sha
         """
@@ -286,13 +296,91 @@ class FindingStore:
                 findings.created_at,
                 findings.disposition,
                 findings.analyst_note,
-                findings.triaged_at
+                findings.triaged_at,
+                findings.history_context_json
             FROM findings
             JOIN commits ON findings.commit_sha = commits.commit_sha
             WHERE findings.id = ?
         """
         with self._connect() as connection:
             return connection.execute(query, (finding_id,)).fetchone()
+
+    def get_history_context(
+        self,
+        repo_name: str,
+        file_name: str,
+        rule_hits: List[str],
+        exclude_commit_sha: Optional[str] = None,
+        limit: int = 25,
+    ) -> Dict[str, Any]:
+        query = """
+            SELECT
+                findings.id,
+                findings.commit_sha,
+                findings.rule_hits_json,
+                findings.disposition
+            FROM findings
+            JOIN commits ON findings.commit_sha = commits.commit_sha
+            WHERE commits.repo_name = ? AND findings.file_name = ?
+            ORDER BY findings.created_at DESC, findings.id DESC
+            LIMIT ?
+        """
+        with self._connect() as connection:
+            rows = connection.execute(query, (repo_name, file_name, limit)).fetchall()
+
+        if exclude_commit_sha:
+            rows = [row for row in rows if row["commit_sha"] != exclude_commit_sha]
+
+        context: Dict[str, Any] = {
+            "same_file_finding_count": len(rows),
+            "matching_rule_hit_count": 0,
+            "matching_true_positive_count": 0,
+            "matching_false_positive_count": 0,
+            "matching_ignored_count": 0,
+            "related_finding_ids": [],
+            "adjustment": "none",
+            "note": "",
+        }
+        if not rows or not rule_hits:
+            return context
+
+        current_rule_hits = set(rule_hits)
+        matching_rows = []
+        for row in rows:
+            prior_rule_hits = set(json.loads(row["rule_hits_json"] or "[]"))
+            if prior_rule_hits.intersection(current_rule_hits):
+                matching_rows.append(row)
+
+        context["matching_rule_hit_count"] = len(matching_rows)
+        context["related_finding_ids"] = [row["id"] for row in matching_rows[:5]]
+        context["matching_true_positive_count"] = sum(
+            1 for row in matching_rows if row["disposition"] == "true_positive"
+        )
+        context["matching_false_positive_count"] = sum(
+            1 for row in matching_rows if row["disposition"] == "false_positive"
+        )
+        context["matching_ignored_count"] = sum(
+            1 for row in matching_rows if row["disposition"] == "ignored"
+        )
+
+        softening_count = (
+            context["matching_false_positive_count"] + context["matching_ignored_count"]
+        )
+        if softening_count >= 1 and context["matching_true_positive_count"] == 0:
+            context["adjustment"] = "reduced"
+            context["note"] = (
+                f"Historical context reduced risk because {softening_count} similar "
+                "finding(s) in this repo/file were previously triaged as false positive or ignored."
+            )
+        elif context["matching_true_positive_count"] >= 1:
+            context["adjustment"] = "reinforced"
+            context["note"] = (
+                f"Historical context reinforced confidence because "
+                f"{context['matching_true_positive_count']} similar finding(s) in this repo/file "
+                "were previously confirmed as true positive."
+            )
+
+        return context
 
     def update_finding_triage(
         self,
@@ -390,6 +478,7 @@ class ThreatHunter:
                     filename=changed_file.filename,
                     patch_data=changed_file.patch,
                     commit_sha=commit_sha,
+                    repo_name=repo_name,
                 )
                 self.store.save_finding(commit_sha, changed_file.filename, result)
                 self._print_result(result)
@@ -398,12 +487,23 @@ class ThreatHunter:
                     yara_path = self.save_yara_rule(result.yara_rule or "", commit_sha, changed_file.filename)
                     print(f"    YARA saved: {yara_path}")
 
-    def analyze_patch(self, filename: str, patch_data: str, commit_sha: str = "test") -> DetectionResult:
+    def analyze_patch(
+        self,
+        filename: str,
+        patch_data: str,
+        commit_sha: str = "test",
+        repo_name: str = DEFAULT_TARGET_REPO,
+    ) -> DetectionResult:
         print("    ... Auditing for threats ...")
 
         rule_result = self.run_prechecks(filename, patch_data)
         if not self.client:
-            return rule_result
+            return self.apply_history_context(
+                repo_name=repo_name,
+                file_name=filename,
+                commit_sha=commit_sha,
+                result=rule_result,
+            )
 
         user_prompt = f"""
 Analyze this GitHub patch for malicious or suspicious activity.
@@ -453,7 +553,13 @@ PATCH:
         payload = self._parse_detection_payload(raw_response)
         payload["raw_response"] = raw_response
         llm_result = DetectionResult(**payload)
-        return self.merge_results(rule_result, llm_result)
+        merged = self.merge_results(rule_result, llm_result)
+        return self.apply_history_context(
+            repo_name=repo_name,
+            file_name=filename,
+            commit_sha=commit_sha,
+            result=merged,
+        )
 
     def run_prechecks(self, filename: str, patch_data: str) -> DetectionResult:
         lower_patch = patch_data.lower()
@@ -568,6 +674,50 @@ PATCH:
             yara_rule=llm_result.yara_rule or rule_result.yara_rule,
             raw_response=llm_result.raw_response,
             rule_hits=ThreatHunter._unique_preserve_order(rule_result.rule_hits + llm_result.rule_hits),
+            history_context=llm_result.history_context or rule_result.history_context,
+        )
+
+    def apply_history_context(
+        self,
+        repo_name: str,
+        file_name: str,
+        commit_sha: str,
+        result: DetectionResult,
+    ) -> DetectionResult:
+        history_context = self.store.get_history_context(
+            repo_name=repo_name,
+            file_name=file_name,
+            rule_hits=result.rule_hits,
+            exclude_commit_sha=commit_sha,
+        )
+        note = history_context.get("note", "")
+        adjustment = history_context.get("adjustment", "none")
+
+        risk = result.normalized_risk()
+        confidence = result.confidence
+        summary = result.summary
+        reasons = list(result.reasons)
+
+        if adjustment == "reduced":
+            risk = self._shift_risk(risk, -1)
+            confidence = max(0, confidence - 15)
+        elif adjustment == "reinforced":
+            confidence = min(100, confidence + 10)
+
+        if note:
+            reasons = self._unique_preserve_order([note] + reasons)
+            summary = f"{summary} {note}"
+
+        return DetectionResult(
+            risk=risk,
+            confidence=confidence,
+            summary=summary,
+            reasons=reasons,
+            indicators=result.indicators,
+            yara_rule=result.yara_rule,
+            raw_response=result.raw_response,
+            rule_hits=result.rule_hits,
+            history_context=history_context,
         )
 
     def save_yara_rule(self, rule_text: str, commit_sha: str, filename: str) -> Path:
@@ -630,10 +780,19 @@ PATCH:
         return items
 
     @staticmethod
+    def _shift_risk(risk: str, delta: int) -> str:
+        ordered_risks = ["unknown", "low", "medium", "high"]
+        normalized = risk if risk in ordered_risks else "unknown"
+        shifted = max(0, min(len(ordered_risks) - 1, ordered_risks.index(normalized) + delta))
+        return ordered_risks[shifted]
+
+    @staticmethod
     def _print_result(result: DetectionResult) -> None:
         print("    [SECURITY REPORT]")
         print(f"    Risk: {result.normalized_risk()} ({result.confidence}% confidence)")
         print(f"    Summary: {result.summary}")
+        if result.history_context.get("adjustment") and result.history_context.get("adjustment") != "none":
+            print(f"    History: {result.history_context['adjustment']}")
         if result.rule_hits:
             print(f"    Rule Hits: {', '.join(result.rule_hits)}")
         if result.reasons:
@@ -666,6 +825,7 @@ def print_findings_table(rows: List[sqlite3.Row]) -> None:
 
     for row in rows:
         rule_hits = json.loads(row["rule_hits_json"] or "[]")
+        history_context = json.loads(row["history_context_json"] or "{}")
         print(
             f"[{row['id']}] {row['risk'].upper():<6} {row['confidence']:>3}% "
             f"{row['disposition']:<14} "
@@ -674,6 +834,8 @@ def print_findings_table(rows: List[sqlite3.Row]) -> None:
         print(f"      {row['summary']}")
         if rule_hits:
             print(f"      Rule hits: {', '.join(rule_hits)}")
+        if history_context.get("adjustment") and history_context.get("adjustment") != "none":
+            print(f"      History: {history_context['adjustment']}")
 
 
 def print_finding_detail(row: Optional[sqlite3.Row]) -> None:
@@ -684,6 +846,7 @@ def print_finding_detail(row: Optional[sqlite3.Row]) -> None:
     reasons = json.loads(row["reasons_json"] or "[]")
     indicators = json.loads(row["indicators_json"] or "[]")
     rule_hits = json.loads(row["rule_hits_json"] or "[]")
+    history_context = json.loads(row["history_context_json"] or "{}")
 
     print(f"Finding #{row['id']}")
     print(f"Repo: {row['repo_name']}")
@@ -701,6 +864,20 @@ def print_finding_detail(row: Optional[sqlite3.Row]) -> None:
     print(f"Summary: {row['summary']}")
     if row["analyst_note"]:
         print(f"Analyst Note: {row['analyst_note']}")
+    if history_context.get("same_file_finding_count"):
+        print("Historical Context:")
+        print(f"  Same-file findings: {history_context.get('same_file_finding_count', 0)}")
+        print(f"  Matching rule-hit findings: {history_context.get('matching_rule_hit_count', 0)}")
+        print(f"  Confirmed true positives: {history_context.get('matching_true_positive_count', 0)}")
+        print(f"  Prior false positives: {history_context.get('matching_false_positive_count', 0)}")
+        print(f"  Prior ignored: {history_context.get('matching_ignored_count', 0)}")
+        if history_context.get("related_finding_ids"):
+            print(
+                "  Related finding ids: "
+                + ", ".join(str(item) for item in history_context["related_finding_ids"])
+            )
+        if history_context.get("note"):
+            print(f"  Adjustment: {history_context['note']}")
     if rule_hits:
         print(f"Rule hits: {', '.join(rule_hits)}")
     if reasons:
@@ -833,7 +1010,12 @@ def main() -> None:
     if args.command == "test":
         from testThreat import FAKE_PATCH
 
-        result = hunter.analyze_patch(args.filename, FAKE_PATCH, commit_sha=args.commit_sha)
+        result = hunter.analyze_patch(
+            args.filename,
+            FAKE_PATCH,
+            commit_sha=args.commit_sha,
+            repo_name=DEFAULT_TARGET_REPO,
+        )
         hunter.store.save_commit_metadata(
             repo_name=DEFAULT_TARGET_REPO,
             commit_sha=args.commit_sha,

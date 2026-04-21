@@ -84,7 +84,7 @@ def test_finding_store_saves_commit_and_finding(tmp_path: Path) -> None:
     with store._connect() as connection:
         commit = connection.execute("SELECT repo_name, commit_sha FROM commits").fetchone()
         finding = connection.execute(
-            "SELECT file_name, risk, confidence, summary, rule_hits_json, disposition, analyst_note FROM findings"
+            "SELECT file_name, risk, confidence, summary, rule_hits_json, disposition, analyst_note, history_context_json FROM findings"
         ).fetchone()
 
     assert commit["repo_name"] == "psf/requests"
@@ -95,6 +95,7 @@ def test_finding_store_saves_commit_and_finding(tmp_path: Path) -> None:
     assert json.loads(finding["rule_hits_json"]) == ["shell-spawn"]
     assert finding["disposition"] == "new"
     assert finding["analyst_note"] == ""
+    assert json.loads(finding["history_context_json"]) == {}
 
 
 def test_save_yara_rule_creates_file(tmp_path: Path) -> None:
@@ -161,3 +162,99 @@ def test_update_finding_triage_sets_disposition_and_note(tmp_path: Path) -> None
     assert row["disposition"] == "true_positive"
     assert row["analyst_note"] == "Confirmed reverse shell behavior."
     assert row["triaged_at"] is not None
+
+
+def test_history_context_reduces_risk_after_false_positive(tmp_path: Path) -> None:
+    hunter = ThreatHunter(
+        github_token=None,
+        openai_api_key=None,
+        db_path=tmp_path / "findings.db",
+        model="gpt-4o",
+    )
+    hunter.store.save_commit_metadata(
+        repo_name="psf/requests",
+        commit_sha="hist001",
+        author_name="alice",
+        commit_message="older shell pattern",
+        html_url=None,
+    )
+    hunter.store.save_finding(
+        "hist001",
+        "requests/api.py",
+        DetectionResult(
+            risk="high",
+            confidence=90,
+            summary="Older shell spawn.",
+            reasons=["launches shell"],
+            indicators=["subprocess", "/bin/sh"],
+            rule_hits=["shell-spawn"],
+        ),
+    )
+    hunter.store.update_finding_triage(1, disposition="false_positive", analyst_note="known admin helper")
+
+    result = hunter.apply_history_context(
+        repo_name="psf/requests",
+        file_name="requests/api.py",
+        commit_sha="new001",
+        result=DetectionResult(
+            risk="high",
+            confidence=88,
+            summary="Current shell spawn.",
+            reasons=["launches shell"],
+            indicators=["subprocess", "/bin/sh"],
+            rule_hits=["shell-spawn"],
+        ),
+    )
+
+    assert result.normalized_risk() == "medium"
+    assert result.confidence == 73
+    assert result.history_context["adjustment"] == "reduced"
+    assert "false positive or ignored" in result.summary
+
+
+def test_history_context_reinforces_confidence_after_true_positive(tmp_path: Path) -> None:
+    hunter = ThreatHunter(
+        github_token=None,
+        openai_api_key=None,
+        db_path=tmp_path / "findings.db",
+        model="gpt-4o",
+    )
+    hunter.store.save_commit_metadata(
+        repo_name="psf/requests",
+        commit_sha="hist002",
+        author_name="alice",
+        commit_message="confirmed reverse shell",
+        html_url=None,
+    )
+    hunter.store.save_finding(
+        "hist002",
+        "requests/api.py",
+        DetectionResult(
+            risk="high",
+            confidence=91,
+            summary="Older reverse shell.",
+            reasons=["launches shell"],
+            indicators=["socket", "dup2", "/bin/sh"],
+            rule_hits=["reverse-shell-pattern"],
+        ),
+    )
+    hunter.store.update_finding_triage(1, disposition="true_positive", analyst_note="confirmed malicious")
+
+    result = hunter.apply_history_context(
+        repo_name="psf/requests",
+        file_name="requests/api.py",
+        commit_sha="new002",
+        result=DetectionResult(
+            risk="high",
+            confidence=80,
+            summary="Current reverse shell.",
+            reasons=["launches shell"],
+            indicators=["socket", "dup2", "/bin/sh"],
+            rule_hits=["reverse-shell-pattern"],
+        ),
+    )
+
+    assert result.normalized_risk() == "high"
+    assert result.confidence == 90
+    assert result.history_context["adjustment"] == "reinforced"
+    assert "true positive" in result.summary

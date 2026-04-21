@@ -85,6 +85,12 @@ python3 watchman.py triage-finding 1 --disposition true_positive --note "Confirm
 python3 watchman.py list-findings --disposition new
 ```
 
+Historical context is automatically applied during analysis when prior findings exist for the same repo/file and matching rule hits:
+
+- prior `false_positive` or `ignored` findings reduce risk and confidence
+- prior `true_positive` findings reinforce confidence
+- `show-finding` displays the stored historical context used during scoring
+
 ## CI/CD practices
 
 The repo now includes a basic CI baseline:
@@ -109,6 +115,7 @@ Findings are stored in SQLite across two tables:
 
 - `commits`: repo, commit SHA, author, message, URL, analysis timestamp
 - `findings`: file name, risk, confidence, summary, reasons, indicators, rule hits, YARA, raw model response, disposition, analyst note, triage timestamp
+- `findings` also store historical context used to adjust the final score
 
 This makes it much easier to build a dashboard, alerting workflow, or evaluation pipeline on top of the scanner.
 
@@ -121,3 +128,4 @@ This version adds a few product-oriented building blocks:
 - CLI commands for scanning and reviewing findings
 - persisted rule hits so local heuristics are auditable later
 - analyst triage workflow with dispositions and notes
+- historical repo/file context to reduce false positives and reinforce known-bad patterns
