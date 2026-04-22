@@ -4,7 +4,14 @@ from pathlib import Path
 
 import watchman
 from testThreat import FAKE_PATCH
-from watchman import DetectionResult, FindingStore, ThreatHunter, load_watchlist
+from watchman import (
+    DetectionResult,
+    FindingStore,
+    ThreatHunter,
+    load_evaluation_dataset,
+    load_suppressions,
+    load_watchlist,
+)
 
 
 def build_test_hunter(tmp_path: Path) -> ThreatHunter:
@@ -126,6 +133,55 @@ def test_load_watchlist_ignores_comments_and_blank_lines(tmp_path: Path) -> None
     repos = load_watchlist(watchlist_path)
 
     assert repos == ["psf/requests", "pallets/flask"]
+
+
+def test_load_suppressions_reads_rule_list(tmp_path: Path) -> None:
+    suppressions_path = tmp_path / "suppressions.json"
+    suppressions_path.write_text(
+        json.dumps(
+            {
+                "rules": [
+                    {
+                        "id": "trusted-shell-helper",
+                        "repo": "psf/*",
+                        "file_pattern": "requests/*.py",
+                        "rule_hits": ["shell-spawn"],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rules = load_suppressions(suppressions_path)
+
+    assert len(rules) == 1
+    assert rules[0]["id"] == "trusted-shell-helper"
+
+
+def test_load_evaluation_dataset_reads_cases(tmp_path: Path) -> None:
+    dataset_path = tmp_path / "dataset.json"
+    dataset_path.write_text(
+        json.dumps(
+            {
+                "cases": [
+                    {
+                        "id": "mal-001",
+                        "repo_name": "psf/requests",
+                        "file_name": "requests/api.py",
+                        "patch": FAKE_PATCH,
+                        "expected_label": "malicious",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cases = load_evaluation_dataset(dataset_path)
+
+    assert len(cases) == 1
+    assert cases[0]["id"] == "mal-001"
 
 
 def test_update_finding_triage_sets_disposition_and_note(tmp_path: Path) -> None:
@@ -258,3 +314,63 @@ def test_history_context_reinforces_confidence_after_true_positive(tmp_path: Pat
     assert result.confidence == 90
     assert result.history_context["adjustment"] == "reinforced"
     assert "true positive" in result.summary
+
+
+def test_suppression_rules_reduce_known_safe_pattern(tmp_path: Path) -> None:
+    hunter = ThreatHunter(
+        github_token=None,
+        openai_api_key=None,
+        db_path=tmp_path / "findings.db",
+        model="gpt-4o",
+        suppressions=[
+            {
+                "id": "trusted-shell-helper",
+                "repo": "psf/*",
+                "file_pattern": "requests/*.py",
+                "rule_hits": ["shell-spawn"],
+            }
+        ],
+    )
+
+    result = hunter.analyze_patch(
+        filename="requests/api.py",
+        patch_data=FAKE_PATCH,
+        commit_sha="supp001",
+        repo_name="psf/requests",
+    )
+
+    assert result.normalized_risk() == "low"
+    assert result.confidence == 25
+    assert result.suppression_context["matched_rule_ids"] == ["trusted-shell-helper"]
+
+
+def test_evaluate_cases_reports_expected_labels(tmp_path: Path) -> None:
+    hunter = ThreatHunter(
+        github_token=None,
+        openai_api_key=None,
+        db_path=tmp_path / "findings.db",
+        model="gpt-4o",
+    )
+
+    results = hunter.evaluate_cases(
+        [
+            {
+                "id": "mal-001",
+                "repo_name": "psf/requests",
+                "file_name": "requests/api.py",
+                "patch": FAKE_PATCH,
+                "expected_label": "malicious",
+            },
+            {
+                "id": "ben-001",
+                "repo_name": "psf/requests",
+                "file_name": "requests/models.py",
+                "patch": "+++ b/requests/models.py\n+def ok():\n+    return 'safe'\n",
+                "expected_label": "benign",
+            },
+        ]
+    )
+
+    assert len(results) == 2
+    assert results[0].passed is True
+    assert results[1].passed is True
