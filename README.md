@@ -26,6 +26,8 @@ Each file-level finding is normalized into:
 - [watchman.py](/Users/abhijithshaji/Documents/GitSecurity/watchman.py): main scanner, detection parsing, and SQLite persistence
 - [testThreat.py](/Users/abhijithshaji/Documents/GitSecurity/testThreat.py): synthetic malicious patch for local testing
 - [watchlist.txt.example](/Users/abhijithshaji/Documents/GitSecurity/watchlist.txt.example): starter watchlist for multi-repo scans
+- [suppressions.json.example](/Users/abhijithshaji/Documents/GitSecurity/suppressions.json.example): starter suppression / allowlist config
+- [datasets/eval_dataset.json](/Users/abhijithshaji/Documents/GitSecurity/datasets/eval_dataset.json): labeled evaluation dataset example
 - `security_findings.db`: generated SQLite database
 - `signatures/`: generated YARA signatures
 
@@ -54,6 +56,11 @@ TARGET_REPO=psf/requests
 OPENAI_MODEL=gpt-4o
 WATCHMAN_DB_PATH=security_findings.db
 WATCHLIST_PATH=watchlist.txt
+SUPPRESSIONS_PATH=suppressions.json
+EVAL_DATASET_PATH=datasets/eval_dataset.json
+ALERTS_LOG_PATH=alerts/alerts.jsonl
+ALERT_MIN_RISK=high
+ALERT_MIN_CONFIDENCE=80
 ```
 
 ## Usage
@@ -84,6 +91,19 @@ python3 watchman.py show-finding 1
 python3 watchman.py triage-finding 1 --disposition true_positive --note "Confirmed reverse shell behavior"
 python3 watchman.py list-findings --disposition new
 ```
+
+Run a labeled evaluation dataset to measure quality:
+
+```bash
+python3 watchman.py evaluate --dataset datasets/eval_dataset.json
+```
+
+Noise reduction and alert delivery:
+
+- suppression rules are loaded from `suppressions.json` and matched by repo, file pattern, and rule hit
+- matching suppressions downgrade known-safe findings to low risk and prevent alert delivery
+- high-confidence unsuppressed findings are written to `alerts/alerts.jsonl`
+- if `ALERT_WEBHOOK_URL` is set, the same alert payload is also posted to that webhook
 
 Historical context is automatically applied during analysis when prior findings exist for the same repo/file and matching rule hits:
 
@@ -116,6 +136,7 @@ Findings are stored in SQLite across two tables:
 - `commits`: repo, commit SHA, author, message, URL, analysis timestamp
 - `findings`: file name, risk, confidence, summary, reasons, indicators, rule hits, YARA, raw model response, disposition, analyst note, triage timestamp
 - `findings` also store historical context used to adjust the final score
+- `findings` also store suppression context used to explain why an alert was reduced
 
 This makes it much easier to build a dashboard, alerting workflow, or evaluation pipeline on top of the scanner.
 
@@ -129,3 +150,6 @@ This version adds a few product-oriented building blocks:
 - persisted rule hits so local heuristics are auditable later
 - analyst triage workflow with dispositions and notes
 - historical repo/file context to reduce false positives and reinforce known-bad patterns
+- suppression rules and allowlist controls for recurring known-safe patterns
+- evaluation datasets and CLI reporting to measure true/false positives and negatives
+- alert delivery to a local alert inbox plus optional webhook
