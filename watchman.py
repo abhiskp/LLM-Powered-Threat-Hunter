@@ -1,7 +1,9 @@
 import argparse
+import fnmatch
 import json
 import os
 import sqlite3
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +23,8 @@ DATABASE_PATH = Path(os.getenv("WATCHMAN_DB_PATH", "security_findings.db"))
 SIGNATURES_DIR = Path("signatures")
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 WATCHLIST_PATH = Path(os.getenv("WATCHLIST_PATH", "watchlist.txt"))
+SUPPRESSIONS_PATH = Path(os.getenv("SUPPRESSIONS_PATH", "suppressions.json"))
+DEFAULT_EVAL_DATASET = Path(os.getenv("EVAL_DATASET_PATH", "datasets/eval_dataset.json"))
 DEFAULT_SCAN_LIMIT = int(os.getenv("WATCHMAN_SCAN_LIMIT", "3"))
 VALID_DISPOSITIONS = {"new", "true_positive", "false_positive", "ignored"}
 
@@ -38,6 +42,7 @@ class DetectionResult:
     raw_response: str = ""
     rule_hits: List[str] = field(default_factory=list)
     history_context: Dict[str, Any] = field(default_factory=dict)
+    suppression_context: Dict[str, Any] = field(default_factory=dict)
 
     def normalized_risk(self) -> str:
         value = (self.risk or "").strip().lower()
@@ -58,6 +63,17 @@ class RuleSignal:
     confidence: int
     reason: str
     indicators: List[str] = field(default_factory=list)
+
+
+@dataclass
+class EvaluationCaseResult:
+    case_id: str
+    expected_label: str
+    predicted_label: str
+    risk: str
+    confidence: int
+    passed: bool
+    summary: str
 
 
 class FindingStore:
@@ -129,6 +145,12 @@ class FindingStore:
                 connection,
                 table_name="findings",
                 column_name="history_context_json",
+                column_sql="TEXT NOT NULL DEFAULT '{}'",
+            )
+            self._ensure_column(
+                connection,
+                table_name="findings",
+                column_name="suppression_context_json",
                 column_sql="TEXT NOT NULL DEFAULT '{}'",
             )
 
@@ -207,9 +229,10 @@ class FindingStore:
                     disposition,
                     analyst_note,
                     triaged_at,
-                    history_context_json
+                    history_context_json,
+                    suppression_context_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     commit_sha,
@@ -227,6 +250,7 @@ class FindingStore:
                     "",
                     None,
                     json.dumps(result.history_context),
+                    json.dumps(result.suppression_context),
                 ),
             )
 
@@ -249,7 +273,8 @@ class FindingStore:
                 findings.created_at,
                 findings.rule_hits_json,
                 findings.disposition,
-                findings.history_context_json
+                findings.history_context_json,
+                findings.suppression_context_json
             FROM findings
             JOIN commits ON findings.commit_sha = commits.commit_sha
         """
@@ -297,7 +322,8 @@ class FindingStore:
                 findings.disposition,
                 findings.analyst_note,
                 findings.triaged_at,
-                findings.history_context_json
+                findings.history_context_json,
+                findings.suppression_context_json
             FROM findings
             JOIN commits ON findings.commit_sha = commits.commit_sha
             WHERE findings.id = ?
@@ -431,11 +457,13 @@ class ThreatHunter:
         openai_api_key: Optional[str],
         db_path: Path = DATABASE_PATH,
         model: str = DEFAULT_MODEL,
+        suppressions: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         self.github = Github(auth=Auth.Token(github_token)) if github_token else None
         self.client = OpenAI(api_key=openai_api_key) if openai_api_key else None
         self.store = FindingStore(db_path)
         self.model = model
+        self.suppressions = suppressions if suppressions is not None else load_suppressions()
         SIGNATURES_DIR.mkdir(parents=True, exist_ok=True)
 
     def monitor_repository(self, repo_name: str, limit: int = 3, skip_existing: bool = True) -> None:
@@ -498,11 +526,16 @@ class ThreatHunter:
 
         rule_result = self.run_prechecks(filename, patch_data)
         if not self.client:
-            return self.apply_history_context(
+            history_adjusted = self.apply_history_context(
                 repo_name=repo_name,
                 file_name=filename,
                 commit_sha=commit_sha,
                 result=rule_result,
+            )
+            return self.apply_suppressions(
+                repo_name=repo_name,
+                file_name=filename,
+                result=history_adjusted,
             )
 
         user_prompt = f"""
@@ -554,11 +587,16 @@ PATCH:
         payload["raw_response"] = raw_response
         llm_result = DetectionResult(**payload)
         merged = self.merge_results(rule_result, llm_result)
-        return self.apply_history_context(
+        history_adjusted = self.apply_history_context(
             repo_name=repo_name,
             file_name=filename,
             commit_sha=commit_sha,
             result=merged,
+        )
+        return self.apply_suppressions(
+            repo_name=repo_name,
+            file_name=filename,
+            result=history_adjusted,
         )
 
     def run_prechecks(self, filename: str, patch_data: str) -> DetectionResult:
@@ -718,6 +756,44 @@ PATCH:
             raw_response=result.raw_response,
             rule_hits=result.rule_hits,
             history_context=history_context,
+            suppression_context=result.suppression_context,
+        )
+
+    def apply_suppressions(
+        self,
+        repo_name: str,
+        file_name: str,
+        result: DetectionResult,
+    ) -> DetectionResult:
+        matched_rules = []
+        for rule in self.suppressions:
+            if not rule.get("enabled", True):
+                continue
+            if self._matches_suppression(rule, repo_name, file_name, result.rule_hits):
+                matched_rules.append(rule)
+
+        if not matched_rules:
+            return result
+
+        rule_names = [str(rule.get("id", "unnamed-rule")) for rule in matched_rules]
+        note = (
+            f"Suppression rules matched: {', '.join(rule_names)}. "
+            "Risk was reduced for a known-safe or suppressed pattern."
+        )
+        return DetectionResult(
+            risk="low",
+            confidence=min(result.confidence, 25),
+            summary=f"{result.summary} {note}",
+            reasons=self._unique_preserve_order([note] + result.reasons),
+            indicators=result.indicators,
+            yara_rule=None,
+            raw_response=result.raw_response,
+            rule_hits=result.rule_hits,
+            history_context=result.history_context,
+            suppression_context={
+                "matched_rule_ids": rule_names,
+                "note": note,
+            },
         )
 
     def save_yara_rule(self, rule_text: str, commit_sha: str, filename: str) -> Path:
@@ -780,6 +856,25 @@ PATCH:
         return items
 
     @staticmethod
+    def _matches_suppression(
+        rule: Dict[str, Any],
+        repo_name: str,
+        file_name: str,
+        rule_hits: List[str],
+    ) -> bool:
+        repo_pattern = str(rule.get("repo", "*"))
+        file_pattern = str(rule.get("file_pattern", "*"))
+        configured_rule_hits = rule.get("rule_hits", [])
+        if not fnmatch.fnmatch(repo_name, repo_pattern):
+            return False
+        if not fnmatch.fnmatch(file_name, file_pattern):
+            return False
+        if not configured_rule_hits:
+            return True
+        configured_values = {str(item).strip() for item in configured_rule_hits if str(item).strip()}
+        return bool(configured_values.intersection(set(rule_hits)))
+
+    @staticmethod
     def _shift_risk(risk: str, delta: int) -> str:
         ordered_risks = ["unknown", "low", "medium", "high"]
         normalized = risk if risk in ordered_risks else "unknown"
@@ -793,12 +888,46 @@ PATCH:
         print(f"    Summary: {result.summary}")
         if result.history_context.get("adjustment") and result.history_context.get("adjustment") != "none":
             print(f"    History: {result.history_context['adjustment']}")
+        if result.suppression_context.get("matched_rule_ids"):
+            print(f"    Suppression: {', '.join(result.suppression_context['matched_rule_ids'])}")
         if result.rule_hits:
             print(f"    Rule Hits: {', '.join(result.rule_hits)}")
         if result.reasons:
             print(f"    Reasons: {', '.join(result.reasons)}")
         if result.indicators:
             print(f"    Indicators: {', '.join(result.indicators)}")
+
+    def evaluate_cases(self, cases: List[Dict[str, Any]]) -> List[EvaluationCaseResult]:
+        results: List[EvaluationCaseResult] = []
+        for index, case in enumerate(cases, start=1):
+            case_id = str(case.get("id", f"case-{index}"))
+            repo_name = str(case.get("repo_name", DEFAULT_TARGET_REPO))
+            file_name = str(case["file_name"])
+            patch = str(case["patch"])
+            expected_label = str(case["expected_label"]).strip().lower()
+            result = self.analyze_patch(
+                filename=file_name,
+                patch_data=patch,
+                commit_sha=case_id,
+                repo_name=repo_name,
+            )
+            predicted_label = self.label_from_risk(result.normalized_risk())
+            results.append(
+                EvaluationCaseResult(
+                    case_id=case_id,
+                    expected_label=expected_label,
+                    predicted_label=predicted_label,
+                    risk=result.normalized_risk(),
+                    confidence=result.confidence,
+                    passed=predicted_label == expected_label,
+                    summary=result.summary,
+                )
+            )
+        return results
+
+    @staticmethod
+    def label_from_risk(risk: str) -> str:
+        return "malicious" if risk in {"medium", "high"} else "benign"
 
 
 def load_watchlist(path: Path = WATCHLIST_PATH) -> List[str]:
@@ -818,6 +947,37 @@ def load_watchlist(path: Path = WATCHLIST_PATH) -> List[str]:
     return repos
 
 
+def load_suppressions(path: Path = SUPPRESSIONS_PATH) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, dict):
+        rules = payload.get("rules", [])
+    elif isinstance(payload, list):
+        rules = payload
+    else:
+        raise ValueError(f"Unsupported suppressions format in {path}")
+
+    if not isinstance(rules, list):
+        raise ValueError(f"Suppression rules must be a list in {path}")
+    return [rule for rule in rules if isinstance(rule, dict)]
+
+
+def load_evaluation_dataset(path: Path) -> List[Dict[str, Any]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, dict):
+        cases = payload.get("cases", [])
+    elif isinstance(payload, list):
+        cases = payload
+    else:
+        raise ValueError(f"Unsupported dataset format in {path}")
+
+    if not isinstance(cases, list):
+        raise ValueError(f"Evaluation dataset must contain a list of cases in {path}")
+    return [case for case in cases if isinstance(case, dict)]
+
+
 def print_findings_table(rows: List[sqlite3.Row]) -> None:
     if not rows:
         print("No findings matched the current filters.")
@@ -826,6 +986,7 @@ def print_findings_table(rows: List[sqlite3.Row]) -> None:
     for row in rows:
         rule_hits = json.loads(row["rule_hits_json"] or "[]")
         history_context = json.loads(row["history_context_json"] or "{}")
+        suppression_context = json.loads(row["suppression_context_json"] or "{}")
         print(
             f"[{row['id']}] {row['risk'].upper():<6} {row['confidence']:>3}% "
             f"{row['disposition']:<14} "
@@ -836,6 +997,8 @@ def print_findings_table(rows: List[sqlite3.Row]) -> None:
             print(f"      Rule hits: {', '.join(rule_hits)}")
         if history_context.get("adjustment") and history_context.get("adjustment") != "none":
             print(f"      History: {history_context['adjustment']}")
+        if suppression_context.get("matched_rule_ids"):
+            print(f"      Suppression: {', '.join(suppression_context['matched_rule_ids'])}")
 
 
 def print_finding_detail(row: Optional[sqlite3.Row]) -> None:
@@ -847,6 +1010,7 @@ def print_finding_detail(row: Optional[sqlite3.Row]) -> None:
     indicators = json.loads(row["indicators_json"] or "[]")
     rule_hits = json.loads(row["rule_hits_json"] or "[]")
     history_context = json.loads(row["history_context_json"] or "{}")
+    suppression_context = json.loads(row["suppression_context_json"] or "{}")
 
     print(f"Finding #{row['id']}")
     print(f"Repo: {row['repo_name']}")
@@ -864,6 +1028,14 @@ def print_finding_detail(row: Optional[sqlite3.Row]) -> None:
     print(f"Summary: {row['summary']}")
     if row["analyst_note"]:
         print(f"Analyst Note: {row['analyst_note']}")
+    if suppression_context.get("matched_rule_ids"):
+        print("Suppression Context:")
+        print(
+            "  Matched rules: "
+            + ", ".join(str(item) for item in suppression_context["matched_rule_ids"])
+        )
+        if suppression_context.get("note"):
+            print(f"  Note: {suppression_context['note']}")
     if history_context.get("same_file_finding_count"):
         print("Historical Context:")
         print(f"  Same-file findings: {history_context.get('same_file_finding_count', 0)}")
@@ -889,12 +1061,74 @@ def print_finding_detail(row: Optional[sqlite3.Row]) -> None:
         print(row["yara_rule"])
 
 
+def print_evaluation_report(results: List[EvaluationCaseResult]) -> None:
+    if not results:
+        print("No evaluation cases were provided.")
+        return
+
+    total = len(results)
+    passed = sum(1 for result in results if result.passed)
+    tp = sum(
+        1
+        for result in results
+        if result.expected_label == "malicious" and result.predicted_label == "malicious"
+    )
+    tn = sum(
+        1
+        for result in results
+        if result.expected_label == "benign" and result.predicted_label == "benign"
+    )
+    fp = sum(
+        1
+        for result in results
+        if result.expected_label == "benign" and result.predicted_label == "malicious"
+    )
+    fn = sum(
+        1
+        for result in results
+        if result.expected_label == "malicious" and result.predicted_label == "benign"
+    )
+
+    print("Evaluation Summary")
+    print(f"  Total cases: {total}")
+    print(f"  Passed: {passed}")
+    print(f"  Failed: {total - passed}")
+    print(f"  Accuracy: {(passed / total) * 100:.1f}%")
+    print(f"  True positives: {tp}")
+    print(f"  True negatives: {tn}")
+    print(f"  False positives: {fp}")
+    print(f"  False negatives: {fn}")
+    print("")
+    print("Case Results")
+    for result in results:
+        status = "PASS" if result.passed else "FAIL"
+        print(
+            f"[{status}] {result.case_id} expected={result.expected_label} "
+            f"predicted={result.predicted_label} risk={result.risk} confidence={result.confidence}"
+        )
+        print(f"       {result.summary}")
+
+
 def build_hunter() -> ThreatHunter:
     return ThreatHunter(
         github_token=GITHUB_TOKEN,
         openai_api_key=OPENAI_API_KEY,
         db_path=DATABASE_PATH,
         model=DEFAULT_MODEL,
+        suppressions=load_suppressions(),
+    )
+
+
+def build_evaluation_hunter(
+    dataset_db_path: Path,
+    use_llm: bool,
+) -> ThreatHunter:
+    return ThreatHunter(
+        github_token=None,
+        openai_api_key=OPENAI_API_KEY if use_llm else None,
+        db_path=dataset_db_path,
+        model=DEFAULT_MODEL,
+        suppressions=load_suppressions(),
     )
 
 
@@ -947,6 +1181,19 @@ def build_parser() -> argparse.ArgumentParser:
     test_parser = subparsers.add_parser("test", help="Run the synthetic local threat test")
     test_parser.add_argument("--filename", default="requests/api.py", help="Logical filename for the synthetic patch")
     test_parser.add_argument("--commit-sha", default="reverse_shell_001", help="Synthetic commit identifier")
+
+    evaluate_parser = subparsers.add_parser("evaluate", help="Run a labeled evaluation dataset")
+    evaluate_parser.add_argument(
+        "--dataset",
+        type=Path,
+        default=DEFAULT_EVAL_DATASET,
+        help="Path to a labeled evaluation dataset JSON file",
+    )
+    evaluate_parser.add_argument(
+        "--use-llm",
+        action="store_true",
+        help="Use the configured LLM during evaluation instead of rule-only scoring",
+    )
 
     return parser
 
@@ -1028,6 +1275,27 @@ def main() -> None:
         if result.should_save_yara():
             yara_path = hunter.save_yara_rule(result.yara_rule or "", args.commit_sha, args.filename)
             print(f"Saved YARA rule to {yara_path}")
+        return
+
+    if args.command == "evaluate":
+        if not args.dataset.exists():
+            print(f"Dataset not found: {args.dataset}")
+            return
+
+        dataset = load_evaluation_dataset(args.dataset)
+        with tempfile.NamedTemporaryFile(prefix="watchman-eval-", suffix=".db", delete=False) as handle:
+            temp_db_path = Path(handle.name)
+
+        try:
+            evaluation_hunter = build_evaluation_hunter(
+                dataset_db_path=temp_db_path,
+                use_llm=args.use_llm,
+            )
+            results = evaluation_hunter.evaluate_cases(dataset)
+            print_evaluation_report(results)
+        finally:
+            if temp_db_path.exists():
+                temp_db_path.unlink()
         return
 
     parser.error(f"Unsupported command: {args.command}")
