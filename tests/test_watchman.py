@@ -8,6 +8,7 @@ from watchman import (
     DetectionResult,
     FindingStore,
     ThreatHunter,
+    deliver_alert,
     load_evaluation_dataset,
     load_suppressions,
     load_watchlist,
@@ -374,3 +375,59 @@ def test_evaluate_cases_reports_expected_labels(tmp_path: Path) -> None:
     assert len(results) == 2
     assert results[0].passed is True
     assert results[1].passed is True
+
+
+def test_deliver_alert_writes_jsonl_log(tmp_path: Path) -> None:
+    original_path = watchman.ALERTS_LOG_PATH
+    original_risk = watchman.ALERT_MIN_RISK
+    original_confidence = watchman.ALERT_MIN_CONFIDENCE
+    try:
+        watchman.ALERTS_LOG_PATH = tmp_path / "alerts.jsonl"
+        watchman.ALERT_MIN_RISK = "high"
+        watchman.ALERT_MIN_CONFIDENCE = 80
+
+        delivery = deliver_alert(
+            repo_name="psf/requests",
+            commit_sha="alert001",
+            file_name="requests/api.py",
+            result=DetectionResult(
+                risk="high",
+                confidence=95,
+                summary="Reverse shell behavior.",
+                reasons=["launches shell"],
+                indicators=["socket", "/bin/sh"],
+                rule_hits=["reverse-shell-pattern"],
+            ),
+        )
+
+        assert delivery.delivered is True
+        assert watchman.ALERTS_LOG_PATH.exists()
+        payload = json.loads(watchman.ALERTS_LOG_PATH.read_text(encoding="utf-8").strip())
+        assert payload["commit_sha"] == "alert001"
+        assert payload["risk"] == "high"
+    finally:
+        watchman.ALERTS_LOG_PATH = original_path
+        watchman.ALERT_MIN_RISK = original_risk
+        watchman.ALERT_MIN_CONFIDENCE = original_confidence
+
+
+def test_deliver_alert_skips_suppressed_findings(tmp_path: Path) -> None:
+    original_path = watchman.ALERTS_LOG_PATH
+    try:
+        watchman.ALERTS_LOG_PATH = tmp_path / "alerts.jsonl"
+        delivery = deliver_alert(
+            repo_name="psf/requests",
+            commit_sha="alert002",
+            file_name="requests/api.py",
+            result=DetectionResult(
+                risk="high",
+                confidence=95,
+                summary="Suppressed shell helper.",
+                suppression_context={"matched_rule_ids": ["trusted-shell-helper"]},
+            ),
+        )
+
+        assert delivery.delivered is False
+        assert watchman.ALERTS_LOG_PATH.exists() is False
+    finally:
+        watchman.ALERTS_LOG_PATH = original_path

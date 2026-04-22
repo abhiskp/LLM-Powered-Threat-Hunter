@@ -1,0 +1,11 @@
+{
+  "rules": [
+    {
+      "id": "trusted-shell-helper",
+      "enabled": true,
+      "repo": "your-org/*",
+      "file_pattern": "tools/admin_helpers.py",
+      "rule_hits": ["shell-spawn"]
+    }
+  ]
+}
