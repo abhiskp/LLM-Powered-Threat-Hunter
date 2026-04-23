@@ -28,6 +28,7 @@ Each file-level finding is normalized into:
 - [watchlist.txt.example](/Users/abhijithshaji/Documents/GitSecurity/watchlist.txt.example): starter watchlist for multi-repo scans
 - [suppressions.json.example](/Users/abhijithshaji/Documents/GitSecurity/suppressions.json.example): starter suppression / allowlist config
 - [datasets/eval_dataset.json](/Users/abhijithshaji/Documents/GitSecurity/datasets/eval_dataset.json): labeled evaluation dataset example
+- [app.py](/Users/abhijithshaji/Documents/GitSecurity/app.py): FastAPI analyst inbox and service API
 - `security_findings.db`: generated SQLite database
 - `signatures/`: generated YARA signatures
 
@@ -71,6 +72,14 @@ Run the local synthetic test flow:
 python3 watchman.py test
 ```
 
+Run the analyst inbox and API:
+
+```bash
+uvicorn app:app --reload
+```
+
+Then open `http://127.0.0.1:8000`.
+
 Scan a single repository:
 
 ```bash
@@ -104,6 +113,25 @@ Noise reduction and alert delivery:
 - matching suppressions downgrade known-safe findings to low risk and prevent alert delivery
 - high-confidence unsuppressed findings are written to `alerts/alerts.jsonl`
 - if `ALERT_WEBHOOK_URL` is set, the same alert payload is also posted to that webhook
+
+## Service API
+
+The repo now includes a product-facing service layer:
+
+- `GET /health`
+- `GET /api/findings`
+- `GET /api/findings/{id}`
+- `POST /api/findings/{id}/triage`
+- `GET /api/alerts`
+- `POST /api/demo/test-scan`
+
+The browser dashboard at `/` provides:
+
+- finding inbox
+- finding detail view
+- triage form
+- alert inbox
+- one-click synthetic demo scan
 
 Historical context is automatically applied during analysis when prior findings exist for the same repo/file and matching rule hits:
 
@@ -153,3 +181,4 @@ This version adds a few product-oriented building blocks:
 - suppression rules and allowlist controls for recurring known-safe patterns
 - evaluation datasets and CLI reporting to measure true/false positives and negatives
 - alert delivery to a local alert inbox plus optional webhook
+- FastAPI service plus analyst inbox UI as the first real product surface
