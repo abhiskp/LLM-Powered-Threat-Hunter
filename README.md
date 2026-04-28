@@ -72,13 +72,13 @@ Run the local synthetic test flow:
 python3 watchman.py test
 ```
 
-Run the analyst inbox and service API:
+Run the analyst inbox and API:
 
 ```bash
 uvicorn app:app --reload
 ```
 
-Open `http://127.0.0.1:8000` to review findings in the browser.
+Then open `http://127.0.0.1:8000`.
 
 Scan a single repository:
 
@@ -116,7 +116,7 @@ Noise reduction and alert delivery:
 
 ## Service API
 
-The repo now includes a product-facing FastAPI service:
+The repo now includes a product-facing service layer:
 
 - `GET /health`
 - `GET /api/findings`
@@ -127,11 +127,11 @@ The repo now includes a product-facing FastAPI service:
 
 The browser dashboard at `/` provides:
 
-- a findings inbox
-- full finding detail
-- triage updates
-- alert inbox visibility
-- a one-click synthetic demo scan
+- finding inbox
+- finding detail view
+- triage form
+- alert inbox
+- one-click synthetic demo scan
 
 Historical context is automatically applied during analysis when prior findings exist for the same repo/file and matching rule hits:
 
@@ -181,4 +181,4 @@ This version adds a few product-oriented building blocks:
 - suppression rules and allowlist controls for recurring known-safe patterns
 - evaluation datasets and CLI reporting to measure true/false positives and negatives
 - alert delivery to a local alert inbox plus optional webhook
-- FastAPI service and analyst inbox as the first product-facing surface
+- FastAPI service plus analyst inbox UI as the first real product surface
