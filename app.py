@@ -1,20 +1,24 @@
 import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlencode
 
-from fastapi import FastAPI, Form, HTTPException, Query
+from fastapi import FastAPI, Form, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from testThreat import FAKE_PATCH
 from watchman import (
     ALERTS_LOG_PATH,
     DATABASE_PATH,
+    DATABASE_URL,
     DEFAULT_TARGET_REPO,
     DEFAULT_MODEL,
     VALID_DISPOSITIONS,
     FindingStore,
+    OwnershipContext,
     ThreatHunter,
     deliver_alert,
+    default_ownership_context,
     load_suppressions,
 )
 
@@ -23,12 +27,32 @@ app = FastAPI(title="Threat Hunter Analyst Inbox", version="0.1.0")
 
 
 def get_store() -> FindingStore:
-    return FindingStore(DATABASE_PATH)
+    return FindingStore(db_path=DATABASE_PATH, database_url=DATABASE_URL)
+
+
+def resolve_request_context(
+    team_slug: Optional[str] = None,
+    team_name: Optional[str] = None,
+    user_email: Optional[str] = None,
+    user_name: Optional[str] = None,
+    x_team_slug: Optional[str] = None,
+    x_team_name: Optional[str] = None,
+    x_user_email: Optional[str] = None,
+    x_user_name: Optional[str] = None,
+) -> OwnershipContext:
+    return default_ownership_context(
+        team_slug=team_slug or x_team_slug,
+        team_name=team_name or x_team_name,
+        user_email=user_email or x_user_email,
+        user_name=user_name or x_user_name,
+    )
 
 
 def row_to_summary(row: Any) -> Dict[str, Any]:
     return {
         "id": row["id"],
+        "team_slug": row["team_slug"],
+        "team_name": row["team_name"],
         "repo_name": row["repo_name"],
         "commit_sha": row["commit_sha"],
         "file_name": row["file_name"],
@@ -46,6 +70,8 @@ def row_to_summary(row: Any) -> Dict[str, Any]:
 def row_to_detail(row: Any) -> Dict[str, Any]:
     return {
         "id": row["id"],
+        "team_slug": row["team_slug"],
+        "team_name": row["team_name"],
         "repo_name": row["repo_name"],
         "commit_sha": row["commit_sha"],
         "author_name": row["author_name"],
@@ -63,6 +89,8 @@ def row_to_detail(row: Any) -> Dict[str, Any]:
         "disposition": row["disposition"],
         "analyst_note": row["analyst_note"],
         "triaged_at": row["triaged_at"],
+        "triaged_by_user_email": row.get("triaged_by_user_email"),
+        "triaged_by_user_name": row.get("triaged_by_user_name"),
         "created_at": row["created_at"],
         "yara_rule": row["yara_rule"],
     }
@@ -87,6 +115,8 @@ def render_dashboard_html(
     selected_finding: Optional[Dict[str, Any]],
     alerts: List[Dict[str, Any]],
     filters: Dict[str, str],
+    session: Dict[str, str],
+    backend_name: str,
 ) -> str:
     selected_panel = "<p class='muted'>Select a finding to inspect its full context.</p>"
     if selected_finding:
@@ -95,6 +125,7 @@ def render_dashboard_html(
         rule_hits = ", ".join(selected_finding["rule_hits"]) or "None"
         history_note = selected_finding["history_context"].get("note", "None")
         suppression_note = selected_finding["suppression_context"].get("note", "None")
+        triaged_by = selected_finding["triaged_by_user_name"] or selected_finding["triaged_by_user_email"] or "None"
         yara_block = ""
         if selected_finding["yara_rule"]:
             yara_block = (
@@ -109,6 +140,7 @@ def render_dashboard_html(
           <p><strong>File:</strong> {selected_finding['file_name']}</p>
           <p><strong>Risk:</strong> {selected_finding['risk']} ({selected_finding['confidence']}%)</p>
           <p><strong>Disposition:</strong> {selected_finding['disposition']}</p>
+          <p><strong>Triaged By:</strong> {triaged_by}</p>
           <p><strong>Summary:</strong> {selected_finding['summary']}</p>
           <p><strong>Rule Hits:</strong> {rule_hits}</p>
           <p><strong>History:</strong> {history_note}</p>
@@ -120,6 +152,10 @@ def render_dashboard_html(
           <ul>{indicators or '<li>None</li>'}</ul>
           {yara_block}
           <form method="post" action="/findings/{selected_finding['id']}/triage" class="triage-form">
+            <input type="hidden" name="team_slug" value="{session['team_slug']}" />
+            <input type="hidden" name="team_name" value="{session['team_name']}" />
+            <input type="hidden" name="user_email" value="{session['user_email']}" />
+            <input type="hidden" name="user_name" value="{session['user_name']}" />
             <label>Disposition</label>
             <select name="disposition">
               {''.join(f"<option value='{value}' {'selected' if selected_finding['disposition'] == value else ''}>{value}</option>" for value in sorted(VALID_DISPOSITIONS))}
@@ -203,6 +239,13 @@ def render_dashboard_html(
         }}
         .hero h1 {{ margin: 0 0 8px; font-size: 2rem; }}
         .hero p {{ margin: 0; color: var(--muted); max-width: 65ch; }}
+        .meta {{
+          margin-top: 14px;
+          color: var(--muted);
+          display: flex;
+          flex-wrap: wrap;
+          gap: 14px;
+        }}
         .actions {{
           margin-top: 18px;
           display: flex;
@@ -289,11 +332,24 @@ def render_dashboard_html(
         <section class="hero">
           <h1>Threat Hunter Analyst Inbox</h1>
           <p>Review suspicious commit diffs, triage findings, and inspect alert history in one place. This is the first product-facing surface on top of the existing threat hunting engine.</p>
+          <div class="meta">
+            <span><strong>Team:</strong> {session['team_name']} ({session['team_slug']})</span>
+            <span><strong>Analyst:</strong> {session['user_name']} ({session['user_email']})</span>
+            <span><strong>Store:</strong> {backend_name}</span>
+          </div>
           <div class="actions">
             <form method="post" action="/demo/test-scan">
+              <input type="hidden" name="team_slug" value="{session['team_slug']}" />
+              <input type="hidden" name="team_name" value="{session['team_name']}" />
+              <input type="hidden" name="user_email" value="{session['user_email']}" />
+              <input type="hidden" name="user_name" value="{session['user_name']}" />
               <button type="submit">Run Synthetic Demo Scan</button>
             </form>
             <form method="get" action="/" class="filters">
+              <input type="hidden" name="team_slug" value="{session['team_slug']}" />
+              <input type="hidden" name="team_name" value="{session['team_name']}" />
+              <input type="hidden" name="user_email" value="{session['user_email']}" />
+              <input type="hidden" name="user_name" value="{session['user_name']}" />
               <select name="risk">
                 <option value="">All risks</option>
                 <option value="high" {'selected' if filters.get('risk') == 'high' else ''}>high</option>
@@ -361,20 +417,98 @@ def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/session")
+def session_api(
+    team_slug: Optional[str] = Query(default=None),
+    team_name: Optional[str] = Query(default=None),
+    user_email: Optional[str] = Query(default=None),
+    user_name: Optional[str] = Query(default=None),
+    x_team_slug: Optional[str] = Header(default=None, alias="X-Team-Slug"),
+    x_team_name: Optional[str] = Header(default=None, alias="X-Team-Name"),
+    x_user_email: Optional[str] = Header(default=None, alias="X-User-Email"),
+    x_user_name: Optional[str] = Header(default=None, alias="X-User-Name"),
+) -> Dict[str, Any]:
+    ownership = resolve_request_context(
+        team_slug=team_slug,
+        team_name=team_name,
+        user_email=user_email,
+        user_name=user_name,
+        x_team_slug=x_team_slug,
+        x_team_name=x_team_name,
+        x_user_email=x_user_email,
+        x_user_name=x_user_name,
+    )
+    store = get_store()
+    record = store.resolve_ownership(ownership)
+    return {
+        "session": {
+            "team_slug": record.team_slug,
+            "team_name": record.team_name,
+            "user_email": record.user_email,
+            "user_name": record.user_name,
+        },
+        "store_backend": store.backend_name,
+    }
+
+
 @app.get("/api/findings")
 def list_findings_api(
     limit: int = Query(default=25, ge=1, le=200),
     risk: Optional[str] = None,
     repo: Optional[str] = None,
     disposition: Optional[str] = None,
+    team_slug: Optional[str] = Query(default=None),
+    team_name: Optional[str] = Query(default=None),
+    user_email: Optional[str] = Query(default=None),
+    user_name: Optional[str] = Query(default=None),
+    x_team_slug: Optional[str] = Header(default=None, alias="X-Team-Slug"),
+    x_team_name: Optional[str] = Header(default=None, alias="X-Team-Name"),
+    x_user_email: Optional[str] = Header(default=None, alias="X-User-Email"),
+    x_user_name: Optional[str] = Header(default=None, alias="X-User-Name"),
 ) -> Dict[str, Any]:
-    rows = get_store().list_findings(limit=limit, risk=risk, repo_name=repo, disposition=disposition)
+    ownership = resolve_request_context(
+        team_slug=team_slug,
+        team_name=team_name,
+        user_email=user_email,
+        user_name=user_name,
+        x_team_slug=x_team_slug,
+        x_team_name=x_team_name,
+        x_user_email=x_user_email,
+        x_user_name=x_user_name,
+    )
+    rows = get_store().list_findings(
+        ownership=ownership,
+        limit=limit,
+        risk=risk,
+        repo_name=repo,
+        disposition=disposition,
+    )
     return {"findings": [row_to_summary(row) for row in rows]}
 
 
 @app.get("/api/findings/{finding_id}")
-def get_finding_api(finding_id: int) -> Dict[str, Any]:
-    row = get_store().get_finding(finding_id)
+def get_finding_api(
+    finding_id: int,
+    team_slug: Optional[str] = Query(default=None),
+    team_name: Optional[str] = Query(default=None),
+    user_email: Optional[str] = Query(default=None),
+    user_name: Optional[str] = Query(default=None),
+    x_team_slug: Optional[str] = Header(default=None, alias="X-Team-Slug"),
+    x_team_name: Optional[str] = Header(default=None, alias="X-Team-Name"),
+    x_user_email: Optional[str] = Header(default=None, alias="X-User-Email"),
+    x_user_name: Optional[str] = Header(default=None, alias="X-User-Name"),
+) -> Dict[str, Any]:
+    ownership = resolve_request_context(
+        team_slug=team_slug,
+        team_name=team_name,
+        user_email=user_email,
+        user_name=user_name,
+        x_team_slug=x_team_slug,
+        x_team_name=x_team_name,
+        x_user_email=x_user_email,
+        x_user_name=x_user_name,
+    )
+    row = get_store().get_finding(ownership=ownership, finding_id=finding_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Finding not found")
     return {"finding": row_to_detail(row)}
@@ -385,11 +519,30 @@ def triage_finding_api(
     finding_id: int,
     disposition: str = Form(...),
     note: str = Form(default=""),
+    team_slug: Optional[str] = Form(default=None),
+    team_name: Optional[str] = Form(default=None),
+    user_email: Optional[str] = Form(default=None),
+    user_name: Optional[str] = Form(default=None),
+    x_team_slug: Optional[str] = Header(default=None, alias="X-Team-Slug"),
+    x_team_name: Optional[str] = Header(default=None, alias="X-Team-Name"),
+    x_user_email: Optional[str] = Header(default=None, alias="X-User-Email"),
+    x_user_name: Optional[str] = Header(default=None, alias="X-User-Name"),
 ) -> Dict[str, Any]:
     if disposition not in VALID_DISPOSITIONS:
         raise HTTPException(status_code=400, detail="Invalid disposition")
 
+    ownership = resolve_request_context(
+        team_slug=team_slug,
+        team_name=team_name,
+        user_email=user_email,
+        user_name=user_name,
+        x_team_slug=x_team_slug,
+        x_team_name=x_team_name,
+        x_user_email=x_user_email,
+        x_user_name=x_user_name,
+    )
     updated = get_store().update_finding_triage(
+        ownership=ownership,
         finding_id=finding_id,
         disposition=disposition,
         analyst_note=note,
@@ -406,14 +559,35 @@ def alerts_api(limit: int = Query(default=20, ge=1, le=200)) -> Dict[str, Any]:
 
 
 @app.post("/api/demo/test-scan")
-def demo_test_scan_api() -> Dict[str, Any]:
+def demo_test_scan_api(
+    team_slug: Optional[str] = Form(default=None),
+    team_name: Optional[str] = Form(default=None),
+    user_email: Optional[str] = Form(default=None),
+    user_name: Optional[str] = Form(default=None),
+    x_team_slug: Optional[str] = Header(default=None, alias="X-Team-Slug"),
+    x_team_name: Optional[str] = Header(default=None, alias="X-Team-Name"),
+    x_user_email: Optional[str] = Header(default=None, alias="X-User-Email"),
+    x_user_name: Optional[str] = Header(default=None, alias="X-User-Name"),
+) -> Dict[str, Any]:
+    ownership = resolve_request_context(
+        team_slug=team_slug,
+        team_name=team_name,
+        user_email=user_email,
+        user_name=user_name,
+        x_team_slug=x_team_slug,
+        x_team_name=x_team_name,
+        x_user_email=x_user_email,
+        x_user_name=x_user_name,
+    )
     commit_sha = f"web_demo_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
     hunter = ThreatHunter(
         github_token=None,
         openai_api_key=None,
         db_path=DATABASE_PATH,
+        database_url=DATABASE_URL,
         model=DEFAULT_MODEL,
         suppressions=load_suppressions(),
+        ownership=ownership,
     )
     result = hunter.analyze_patch(
         filename="requests/api.py",
@@ -422,14 +596,22 @@ def demo_test_scan_api() -> Dict[str, Any]:
         repo_name=DEFAULT_TARGET_REPO,
     )
     hunter.store.save_commit_metadata(
+        ownership=ownership,
         repo_name=DEFAULT_TARGET_REPO,
         commit_sha=commit_sha,
         author_name="web-demo",
         commit_message="Synthetic reverse shell patch",
         html_url=None,
     )
-    hunter.store.save_finding(commit_sha, "requests/api.py", result)
+    hunter.store.save_finding(
+        ownership=ownership,
+        repo_name=DEFAULT_TARGET_REPO,
+        commit_sha=commit_sha,
+        file_name="requests/api.py",
+        result=result,
+    )
     delivery = deliver_alert(
+        ownership=ownership,
         repo_name=DEFAULT_TARGET_REPO,
         commit_sha=commit_sha,
         file_name="requests/api.py",
@@ -442,6 +624,7 @@ def demo_test_scan_api() -> Dict[str, Any]:
         "risk": result.normalized_risk(),
         "confidence": result.confidence,
         "alert_channels": delivery.channels,
+        "team_slug": ownership.team_slug,
     }
 
 
@@ -451,17 +634,37 @@ def dashboard(
     limit: int = 25,
     risk: Optional[str] = None,
     disposition: Optional[str] = None,
+    team_slug: Optional[str] = None,
+    team_name: Optional[str] = None,
+    user_email: Optional[str] = None,
+    user_name: Optional[str] = None,
 ) -> HTMLResponse:
     store = get_store()
-    findings = [row_to_summary(row) for row in store.list_findings(limit=limit, risk=risk, repo_name=None, disposition=disposition)]
+    ownership = resolve_request_context(
+        team_slug=team_slug,
+        team_name=team_name,
+        user_email=user_email,
+        user_name=user_name,
+    )
+    record = store.resolve_ownership(ownership)
+    findings = [
+        row_to_summary(row)
+        for row in store.list_findings(
+            ownership=ownership,
+            limit=limit,
+            risk=risk,
+            repo_name=None,
+            disposition=disposition,
+        )
+    ]
 
     selected_finding = None
     if finding_id is not None:
-        row = store.get_finding(finding_id)
+        row = store.get_finding(ownership=ownership, finding_id=finding_id)
         if row:
             selected_finding = row_to_detail(row)
     elif findings:
-        row = store.get_finding(findings[0]["id"])
+        row = store.get_finding(ownership=ownership, finding_id=findings[0]["id"])
         if row:
             selected_finding = row_to_detail(row)
 
@@ -474,6 +677,13 @@ def dashboard(
             "risk": risk or "",
             "disposition": disposition or "",
         },
+        session={
+            "team_slug": record.team_slug,
+            "team_name": record.team_name,
+            "user_email": record.user_email,
+            "user_name": record.user_name,
+        },
+        backend_name=store.backend_name,
     )
     return HTMLResponse(content=html)
 
@@ -483,10 +693,21 @@ def triage_finding_form(
     finding_id: int,
     disposition: str = Form(...),
     note: str = Form(default=""),
+    team_slug: Optional[str] = Form(default=None),
+    team_name: Optional[str] = Form(default=None),
+    user_email: Optional[str] = Form(default=None),
+    user_name: Optional[str] = Form(default=None),
 ) -> RedirectResponse:
     if disposition not in VALID_DISPOSITIONS:
         raise HTTPException(status_code=400, detail="Invalid disposition")
+    ownership = resolve_request_context(
+        team_slug=team_slug,
+        team_name=team_name,
+        user_email=user_email,
+        user_name=user_name,
+    )
     updated = get_store().update_finding_triage(
+        ownership=ownership,
         finding_id=finding_id,
         disposition=disposition,
         analyst_note=note,
@@ -494,13 +715,81 @@ def triage_finding_form(
     )
     if not updated:
         raise HTTPException(status_code=404, detail="Finding not found")
-    return RedirectResponse(url=f"/?finding_id={finding_id}", status_code=303)
+    query_string = urlencode(
+        {
+            "finding_id": finding_id,
+            "team_slug": ownership.team_slug,
+            "team_name": ownership.team_name,
+            "user_email": ownership.user_email,
+            "user_name": ownership.user_name,
+        }
+    )
+    return RedirectResponse(
+        url=f"/?{query_string}",
+        status_code=303,
+    )
 
 
 @app.post("/demo/test-scan")
-def demo_test_scan_form() -> RedirectResponse:
-    demo_test_scan_api()
-    rows = get_store().list_findings(limit=1)
+def demo_test_scan_form(
+    team_slug: Optional[str] = Form(default=None),
+    team_name: Optional[str] = Form(default=None),
+    user_email: Optional[str] = Form(default=None),
+    user_name: Optional[str] = Form(default=None),
+) -> RedirectResponse:
+    ownership = resolve_request_context(
+        team_slug=team_slug,
+        team_name=team_name,
+        user_email=user_email,
+        user_name=user_name,
+    )
+    commit_sha = f"web_demo_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+    hunter = ThreatHunter(
+        github_token=None,
+        openai_api_key=None,
+        db_path=DATABASE_PATH,
+        database_url=DATABASE_URL,
+        model=DEFAULT_MODEL,
+        suppressions=load_suppressions(),
+        ownership=ownership,
+    )
+    result = hunter.analyze_patch(
+        filename="requests/api.py",
+        patch_data=FAKE_PATCH,
+        commit_sha=commit_sha,
+        repo_name=DEFAULT_TARGET_REPO,
+    )
+    hunter.store.save_commit_metadata(
+        ownership=ownership,
+        repo_name=DEFAULT_TARGET_REPO,
+        commit_sha=commit_sha,
+        author_name="web-demo",
+        commit_message="Synthetic reverse shell patch",
+        html_url=None,
+    )
+    hunter.store.save_finding(
+        ownership=ownership,
+        repo_name=DEFAULT_TARGET_REPO,
+        commit_sha=commit_sha,
+        file_name="requests/api.py",
+        result=result,
+    )
+    deliver_alert(
+        ownership=ownership,
+        repo_name=DEFAULT_TARGET_REPO,
+        commit_sha=commit_sha,
+        file_name="requests/api.py",
+        result=result,
+    )
+    rows = get_store().list_findings(ownership=ownership, limit=1)
     redirect_id = rows[0]["id"] if rows else None
-    target = f"/?finding_id={redirect_id}" if redirect_id else "/"
+    query_payload = {
+        "team_slug": ownership.team_slug,
+        "team_name": ownership.team_name,
+        "user_email": ownership.user_email,
+        "user_name": ownership.user_name,
+    }
+    if redirect_id:
+        query_payload["finding_id"] = str(redirect_id)
+    target = f"/?{urlencode(query_payload)}"
     return RedirectResponse(url=target, status_code=303)

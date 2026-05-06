@@ -2,7 +2,6 @@ import argparse
 import fnmatch
 import json
 import os
-import sqlite3
 import tempfile
 import urllib.error
 import urllib.request
@@ -14,6 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional
 from dotenv import load_dotenv
 from github import Auth, Github
 from openai import OpenAI
+from storage import FindingStore, OwnershipContext
 
 
 load_dotenv()
@@ -22,6 +22,7 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DEFAULT_TARGET_REPO = os.getenv("TARGET_REPO", "psf/requests")
 DATABASE_PATH = Path(os.getenv("WATCHMAN_DB_PATH", "security_findings.db"))
+DATABASE_URL = os.getenv("WATCHMAN_DATABASE_URL")
 SIGNATURES_DIR = Path("signatures")
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 WATCHLIST_PATH = Path(os.getenv("WATCHLIST_PATH", "watchlist.txt"))
@@ -32,6 +33,10 @@ ALERTS_LOG_PATH = Path(os.getenv("ALERTS_LOG_PATH", "alerts/alerts.jsonl"))
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")
 ALERT_MIN_RISK = os.getenv("ALERT_MIN_RISK", "high").strip().lower()
 ALERT_MIN_CONFIDENCE = int(os.getenv("ALERT_MIN_CONFIDENCE", "80"))
+DEFAULT_TEAM_SLUG = os.getenv("WATCHMAN_DEFAULT_TEAM_SLUG", "personal-lab")
+DEFAULT_TEAM_NAME = os.getenv("WATCHMAN_DEFAULT_TEAM_NAME", "Personal Lab")
+DEFAULT_USER_EMAIL = os.getenv("WATCHMAN_DEFAULT_USER_EMAIL", "analyst@example.com")
+DEFAULT_USER_NAME = os.getenv("WATCHMAN_DEFAULT_USER_NAME", "Local Analyst")
 VALID_DISPOSITIONS = {"new", "true_positive", "false_positive", "ignored"}
 
 RISK_ORDER = {"unknown": 0, "low": 1, "medium": 2, "high": 3}
@@ -88,379 +93,18 @@ class AlertDeliveryResult:
     channels: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
 
-
-class FindingStore:
-    def __init__(self, db_path: Path) -> None:
-        self.db_path = db_path
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._initialize()
-
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path)
-        connection.row_factory = sqlite3.Row
-        return connection
-
-    def _initialize(self) -> None:
-        with self._connect() as connection:
-            connection.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS commits (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    repo_name TEXT NOT NULL,
-                    commit_sha TEXT NOT NULL UNIQUE,
-                    author_name TEXT,
-                    commit_message TEXT,
-                    html_url TEXT,
-                    analyzed_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS findings (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    commit_sha TEXT NOT NULL,
-                    file_name TEXT NOT NULL,
-                    risk TEXT NOT NULL,
-                    confidence INTEGER NOT NULL,
-                    summary TEXT NOT NULL,
-                    reasons_json TEXT NOT NULL,
-                    indicators_json TEXT NOT NULL,
-                    yara_rule TEXT,
-                    raw_response TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY(commit_sha) REFERENCES commits(commit_sha)
-                );
-                """
-            )
-            self._ensure_column(
-                connection,
-                table_name="findings",
-                column_name="rule_hits_json",
-                column_sql="TEXT NOT NULL DEFAULT '[]'",
-            )
-            self._ensure_column(
-                connection,
-                table_name="findings",
-                column_name="disposition",
-                column_sql="TEXT NOT NULL DEFAULT 'new'",
-            )
-            self._ensure_column(
-                connection,
-                table_name="findings",
-                column_name="analyst_note",
-                column_sql="TEXT NOT NULL DEFAULT ''",
-            )
-            self._ensure_column(
-                connection,
-                table_name="findings",
-                column_name="triaged_at",
-                column_sql="TEXT",
-            )
-            self._ensure_column(
-                connection,
-                table_name="findings",
-                column_name="history_context_json",
-                column_sql="TEXT NOT NULL DEFAULT '{}'",
-            )
-            self._ensure_column(
-                connection,
-                table_name="findings",
-                column_name="suppression_context_json",
-                column_sql="TEXT NOT NULL DEFAULT '{}'",
-            )
-
-    @staticmethod
-    def _ensure_column(
-        connection: sqlite3.Connection,
-        table_name: str,
-        column_name: str,
-        column_sql: str,
-    ) -> None:
-        columns = {
-            row["name"]
-            for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
-        }
-        if column_name not in columns:
-            try:
-                connection.execute(
-                    f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}"
-                )
-            except sqlite3.OperationalError as exc:
-                if "duplicate column name" not in str(exc).lower():
-                    raise
-
-    def commit_exists(self, commit_sha: str) -> bool:
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT 1 FROM commits WHERE commit_sha = ?",
-                (commit_sha,),
-            ).fetchone()
-        return row is not None
-
-    def save_commit_metadata(
-        self,
-        repo_name: str,
-        commit_sha: str,
-        author_name: Optional[str],
-        commit_message: Optional[str],
-        html_url: Optional[str],
-    ) -> None:
-        analyzed_at = datetime.now(timezone.utc).isoformat()
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO commits (
-                    repo_name, commit_sha, author_name, commit_message, html_url, analyzed_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    repo_name,
-                    commit_sha,
-                    author_name,
-                    commit_message,
-                    html_url,
-                    analyzed_at,
-                ),
-            )
-
-    def save_finding(self, commit_sha: str, file_name: str, result: DetectionResult) -> None:
-        created_at = datetime.now(timezone.utc).isoformat()
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO findings (
-                    commit_sha,
-                    file_name,
-                    risk,
-                    confidence,
-                    summary,
-                    reasons_json,
-                    indicators_json,
-                    yara_rule,
-                    raw_response,
-                    created_at,
-                    rule_hits_json,
-                    disposition,
-                    analyst_note,
-                    triaged_at,
-                    history_context_json,
-                    suppression_context_json
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    commit_sha,
-                    file_name,
-                    result.normalized_risk(),
-                    result.confidence,
-                    result.summary,
-                    json.dumps(result.reasons),
-                    json.dumps(result.indicators),
-                    result.yara_rule,
-                    result.raw_response,
-                    created_at,
-                    json.dumps(result.rule_hits),
-                    "new",
-                    "",
-                    None,
-                    json.dumps(result.history_context),
-                    json.dumps(result.suppression_context),
-                ),
-            )
-
-    def list_findings(
-        self,
-        limit: int = 20,
-        risk: Optional[str] = None,
-        repo_name: Optional[str] = None,
-        disposition: Optional[str] = None,
-    ) -> List[sqlite3.Row]:
-        query = """
-            SELECT
-                findings.id,
-                commits.repo_name,
-                findings.commit_sha,
-                findings.file_name,
-                findings.risk,
-                findings.confidence,
-                findings.summary,
-                findings.created_at,
-                findings.rule_hits_json,
-                findings.disposition,
-                findings.history_context_json,
-                findings.suppression_context_json
-            FROM findings
-            JOIN commits ON findings.commit_sha = commits.commit_sha
-        """
-        filters: List[str] = []
-        params: List[Any] = []
-
-        if risk:
-            filters.append("findings.risk = ?")
-            params.append(risk.lower())
-        if repo_name:
-            filters.append("commits.repo_name = ?")
-            params.append(repo_name)
-        if disposition:
-            filters.append("findings.disposition = ?")
-            params.append(disposition)
-
-        if filters:
-            query += " WHERE " + " AND ".join(filters)
-
-        query += " ORDER BY findings.created_at DESC, findings.id DESC LIMIT ?"
-        params.append(limit)
-
-        with self._connect() as connection:
-            return connection.execute(query, params).fetchall()
-
-    def get_finding(self, finding_id: int) -> Optional[sqlite3.Row]:
-        query = """
-            SELECT
-                findings.id,
-                commits.repo_name,
-                findings.commit_sha,
-                commits.author_name,
-                commits.commit_message,
-                commits.html_url,
-                findings.file_name,
-                findings.risk,
-                findings.confidence,
-                findings.summary,
-                findings.reasons_json,
-                findings.indicators_json,
-                findings.yara_rule,
-                findings.rule_hits_json,
-                findings.raw_response,
-                findings.created_at,
-                findings.disposition,
-                findings.analyst_note,
-                findings.triaged_at,
-                findings.history_context_json,
-                findings.suppression_context_json
-            FROM findings
-            JOIN commits ON findings.commit_sha = commits.commit_sha
-            WHERE findings.id = ?
-        """
-        with self._connect() as connection:
-            return connection.execute(query, (finding_id,)).fetchone()
-
-    def get_history_context(
-        self,
-        repo_name: str,
-        file_name: str,
-        rule_hits: List[str],
-        exclude_commit_sha: Optional[str] = None,
-        limit: int = 25,
-    ) -> Dict[str, Any]:
-        query = """
-            SELECT
-                findings.id,
-                findings.commit_sha,
-                findings.rule_hits_json,
-                findings.disposition
-            FROM findings
-            JOIN commits ON findings.commit_sha = commits.commit_sha
-            WHERE commits.repo_name = ? AND findings.file_name = ?
-            ORDER BY findings.created_at DESC, findings.id DESC
-            LIMIT ?
-        """
-        with self._connect() as connection:
-            rows = connection.execute(query, (repo_name, file_name, limit)).fetchall()
-
-        if exclude_commit_sha:
-            rows = [row for row in rows if row["commit_sha"] != exclude_commit_sha]
-
-        context: Dict[str, Any] = {
-            "same_file_finding_count": len(rows),
-            "matching_rule_hit_count": 0,
-            "matching_true_positive_count": 0,
-            "matching_false_positive_count": 0,
-            "matching_ignored_count": 0,
-            "related_finding_ids": [],
-            "adjustment": "none",
-            "note": "",
-        }
-        if not rows or not rule_hits:
-            return context
-
-        current_rule_hits = set(rule_hits)
-        matching_rows = []
-        for row in rows:
-            prior_rule_hits = set(json.loads(row["rule_hits_json"] or "[]"))
-            if prior_rule_hits.intersection(current_rule_hits):
-                matching_rows.append(row)
-
-        context["matching_rule_hit_count"] = len(matching_rows)
-        context["related_finding_ids"] = [row["id"] for row in matching_rows[:5]]
-        context["matching_true_positive_count"] = sum(
-            1 for row in matching_rows if row["disposition"] == "true_positive"
-        )
-        context["matching_false_positive_count"] = sum(
-            1 for row in matching_rows if row["disposition"] == "false_positive"
-        )
-        context["matching_ignored_count"] = sum(
-            1 for row in matching_rows if row["disposition"] == "ignored"
-        )
-
-        softening_count = (
-            context["matching_false_positive_count"] + context["matching_ignored_count"]
-        )
-        if softening_count >= 1 and context["matching_true_positive_count"] == 0:
-            context["adjustment"] = "reduced"
-            context["note"] = (
-                f"Historical context reduced risk because {softening_count} similar "
-                "finding(s) in this repo/file were previously triaged as false positive or ignored."
-            )
-        elif context["matching_true_positive_count"] >= 1:
-            context["adjustment"] = "reinforced"
-            context["note"] = (
-                f"Historical context reinforced confidence because "
-                f"{context['matching_true_positive_count']} similar finding(s) in this repo/file "
-                "were previously confirmed as true positive."
-            )
-
-        return context
-
-    def update_finding_triage(
-        self,
-        finding_id: int,
-        disposition: str,
-        analyst_note: Optional[str] = None,
-        clear_note: bool = False,
-    ) -> bool:
-        normalized = disposition.strip().lower()
-        if normalized not in VALID_DISPOSITIONS:
-            raise ValueError(f"Invalid disposition: {disposition}")
-
-        with self._connect() as connection:
-            current = connection.execute(
-                "SELECT analyst_note FROM findings WHERE id = ?",
-                (finding_id,),
-            ).fetchone()
-            if current is None:
-                return False
-
-            if clear_note:
-                note_value = ""
-            elif analyst_note is None:
-                note_value = current["analyst_note"]
-            else:
-                note_value = analyst_note.strip()
-
-            connection.execute(
-                """
-                UPDATE findings
-                SET disposition = ?, analyst_note = ?, triaged_at = ?
-                WHERE id = ?
-                """,
-                (
-                    normalized,
-                    note_value,
-                    datetime.now(timezone.utc).isoformat(),
-                    finding_id,
-                ),
-            )
-        return True
+def default_ownership_context(
+    team_slug: Optional[str] = None,
+    team_name: Optional[str] = None,
+    user_email: Optional[str] = None,
+    user_name: Optional[str] = None,
+) -> OwnershipContext:
+    return OwnershipContext(
+        team_slug=(team_slug or DEFAULT_TEAM_SLUG).strip(),
+        team_name=(team_name or DEFAULT_TEAM_NAME).strip(),
+        user_email=(user_email or DEFAULT_USER_EMAIL).strip(),
+        user_name=(user_name or DEFAULT_USER_NAME).strip(),
+    )
 
 
 class ThreatHunter:
@@ -469,14 +113,18 @@ class ThreatHunter:
         github_token: Optional[str],
         openai_api_key: Optional[str],
         db_path: Path = DATABASE_PATH,
+        database_url: Optional[str] = DATABASE_URL,
         model: str = DEFAULT_MODEL,
         suppressions: Optional[List[Dict[str, Any]]] = None,
+        ownership: Optional[OwnershipContext] = None,
+        store: Optional[FindingStore] = None,
     ) -> None:
         self.github = Github(auth=Auth.Token(github_token)) if github_token else None
         self.client = OpenAI(api_key=openai_api_key) if openai_api_key else None
-        self.store = FindingStore(db_path)
+        self.store = store or FindingStore(db_path=db_path, database_url=database_url)
         self.model = model
         self.suppressions = suppressions if suppressions is not None else load_suppressions()
+        self.ownership = ownership or default_ownership_context()
         SIGNATURES_DIR.mkdir(parents=True, exist_ok=True)
 
     def monitor_repository(self, repo_name: str, limit: int = 3, skip_existing: bool = True) -> None:
@@ -493,7 +141,7 @@ class ThreatHunter:
                 break
 
             commit_sha = commit.sha
-            if skip_existing and self.store.commit_exists(commit_sha):
+            if skip_existing and self.store.commit_exists(self.ownership, repo_name, commit_sha):
                 print(f"\n[-] Skipping {commit_sha[:7]} (already analyzed)")
                 continue
 
@@ -503,6 +151,7 @@ class ThreatHunter:
             print(f"    Author: {author_name}")
 
             self.store.save_commit_metadata(
+                ownership=self.ownership,
                 repo_name=repo_name,
                 commit_sha=commit_sha,
                 author_name=author_name,
@@ -521,9 +170,16 @@ class ThreatHunter:
                     commit_sha=commit_sha,
                     repo_name=repo_name,
                 )
-                self.store.save_finding(commit_sha, changed_file.filename, result)
+                self.store.save_finding(
+                    ownership=self.ownership,
+                    repo_name=repo_name,
+                    commit_sha=commit_sha,
+                    file_name=changed_file.filename,
+                    result=result,
+                )
                 self._print_result(result)
                 delivery = deliver_alert(
+                    ownership=self.ownership,
                     repo_name=repo_name,
                     commit_sha=commit_sha,
                     file_name=changed_file.filename,
@@ -746,6 +402,7 @@ PATCH:
         result: DetectionResult,
     ) -> DetectionResult:
         history_context = self.store.get_history_context(
+            ownership=self.ownership,
             repo_name=repo_name,
             file_name=file_name,
             rule_hits=result.rule_hits,
@@ -1001,7 +658,7 @@ def load_evaluation_dataset(path: Path) -> List[Dict[str, Any]]:
     return [case for case in cases if isinstance(case, dict)]
 
 
-def print_findings_table(rows: List[sqlite3.Row]) -> None:
+def print_findings_table(rows: List[Dict[str, Any]]) -> None:
     if not rows:
         print("No findings matched the current filters.")
         return
@@ -1024,7 +681,7 @@ def print_findings_table(rows: List[sqlite3.Row]) -> None:
             print(f"      Suppression: {', '.join(suppression_context['matched_rule_ids'])}")
 
 
-def print_finding_detail(row: Optional[sqlite3.Row]) -> None:
+def print_finding_detail(row: Optional[Dict[str, Any]]) -> None:
     if row is None:
         print("Finding not found.")
         return
@@ -1159,12 +816,15 @@ def should_deliver_alert(result: DetectionResult) -> bool:
 
 
 def build_alert_payload(
+    ownership: OwnershipContext,
     repo_name: str,
     commit_sha: str,
     file_name: str,
     result: DetectionResult,
 ) -> Dict[str, Any]:
     return {
+        "team_slug": ownership.team_slug,
+        "team_name": ownership.team_name,
         "repo_name": repo_name,
         "commit_sha": commit_sha,
         "file_name": file_name,
@@ -1181,6 +841,7 @@ def build_alert_payload(
 
 
 def deliver_alert(
+    ownership: OwnershipContext,
     repo_name: str,
     commit_sha: str,
     file_name: str,
@@ -1189,7 +850,7 @@ def deliver_alert(
     if not should_deliver_alert(result):
         return AlertDeliveryResult(delivered=False)
 
-    payload = build_alert_payload(repo_name, commit_sha, file_name, result)
+    payload = build_alert_payload(ownership, repo_name, commit_sha, file_name, result)
     channels: List[str] = []
     errors: List[str] = []
 
@@ -1220,8 +881,10 @@ def build_hunter() -> ThreatHunter:
         github_token=GITHUB_TOKEN,
         openai_api_key=OPENAI_API_KEY,
         db_path=DATABASE_PATH,
+        database_url=DATABASE_URL,
         model=DEFAULT_MODEL,
         suppressions=load_suppressions(),
+        ownership=default_ownership_context(),
     )
 
 
@@ -1233,13 +896,40 @@ def build_evaluation_hunter(
         github_token=None,
         openai_api_key=OPENAI_API_KEY if use_llm else None,
         db_path=dataset_db_path,
+        database_url=None,
         model=DEFAULT_MODEL,
         suppressions=load_suppressions(),
+        ownership=default_ownership_context(
+            team_slug="evaluation-team",
+            team_name="Evaluation Team",
+            user_email="evaluation@watchman.local",
+            user_name="Evaluation Runner",
+        ),
     )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="LLM-powered GitHub commit threat hunter")
+    parser.add_argument(
+        "--team-slug",
+        default=DEFAULT_TEAM_SLUG,
+        help="Logical team slug for ownership scoping",
+    )
+    parser.add_argument(
+        "--team-name",
+        default=DEFAULT_TEAM_NAME,
+        help="Display name for the current team context",
+    )
+    parser.add_argument(
+        "--user-email",
+        default=DEFAULT_USER_EMAIL,
+        help="Analyst email for ownership and triage attribution",
+    )
+    parser.add_argument(
+        "--user-name",
+        default=DEFAULT_USER_NAME,
+        help="Analyst display name for ownership and triage attribution",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     scan_parser = subparsers.add_parser("scan", help="Scan a single repository")
@@ -1307,11 +997,25 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    ownership = default_ownership_context(
+        team_slug=args.team_slug,
+        team_name=args.team_name,
+        user_email=args.user_email,
+        user_name=args.user_name,
+    )
 
     if args.command in {"scan", "scan-watchlist", "test"}:
-        hunter = build_hunter()
+        hunter = ThreatHunter(
+            github_token=GITHUB_TOKEN,
+            openai_api_key=OPENAI_API_KEY,
+            db_path=DATABASE_PATH,
+            database_url=DATABASE_URL,
+            model=DEFAULT_MODEL,
+            suppressions=load_suppressions(),
+            ownership=ownership,
+        )
     else:
-        store = FindingStore(DATABASE_PATH)
+        store = FindingStore(db_path=DATABASE_PATH, database_url=DATABASE_URL)
 
     if args.command == "scan":
         hunter.monitor_repository(args.repo, limit=args.limit, skip_existing=not args.include_existing)
@@ -1329,6 +1033,7 @@ def main() -> None:
     if args.command == "list-findings":
         print_findings_table(
             store.list_findings(
+                ownership=ownership,
                 limit=args.limit,
                 risk=args.risk,
                 repo_name=args.repo,
@@ -1338,12 +1043,13 @@ def main() -> None:
         return
 
     if args.command == "show-finding":
-        print_finding_detail(store.get_finding(args.finding_id))
+        print_finding_detail(store.get_finding(ownership=ownership, finding_id=args.finding_id))
         return
 
     if args.command == "triage-finding":
         updated = store.update_finding_triage(
-            args.finding_id,
+            ownership=ownership,
+            finding_id=args.finding_id,
             disposition=args.disposition,
             analyst_note=args.note,
             clear_note=args.clear_note,
@@ -1370,15 +1076,23 @@ def main() -> None:
             repo_name=DEFAULT_TARGET_REPO,
         )
         hunter.store.save_commit_metadata(
+            ownership=ownership,
             repo_name=DEFAULT_TARGET_REPO,
             commit_sha=args.commit_sha,
             author_name="local-test",
             commit_message="Synthetic reverse shell patch",
             html_url=None,
         )
-        hunter.store.save_finding(args.commit_sha, args.filename, result)
+        hunter.store.save_finding(
+            ownership=ownership,
+            repo_name=DEFAULT_TARGET_REPO,
+            commit_sha=args.commit_sha,
+            file_name=args.filename,
+            result=result,
+        )
         hunter._print_result(result)
         delivery = deliver_alert(
+            ownership=ownership,
             repo_name=DEFAULT_TARGET_REPO,
             commit_sha=args.commit_sha,
             file_name=args.filename,
