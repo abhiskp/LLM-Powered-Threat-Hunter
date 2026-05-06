@@ -7,8 +7,9 @@ Automated pipeline to monitor GitHub repositories for suspicious commits, score 
 - Pulls recent commits from a target GitHub repository
 - Analyzes changed file patches with an LLM
 - Returns structured detection results
-- Stores commit metadata and findings in SQLite
+- Stores commit metadata and findings in SQLite or PostgreSQL
 - Saves generated YARA rules for medium- and high-risk findings
+- Scopes findings to a team and analyst context so the app is ready for multi-user workflows
 
 ## Structured finding format
 
@@ -24,6 +25,7 @@ Each file-level finding is normalized into:
 ## Project files
 
 - [watchman.py](/Users/abhijithshaji/Documents/GitSecurity/watchman.py): main scanner, detection parsing, and SQLite persistence
+- [storage.py](/Users/abhijithshaji/Documents/GitSecurity/storage.py): abstract store layer with SQLite and PostgreSQL backends plus team/user ownership
 - [testThreat.py](/Users/abhijithshaji/Documents/GitSecurity/testThreat.py): synthetic malicious patch for local testing
 - [watchlist.txt.example](/Users/abhijithshaji/Documents/GitSecurity/watchlist.txt.example): starter watchlist for multi-repo scans
 - [suppressions.json.example](/Users/abhijithshaji/Documents/GitSecurity/suppressions.json.example): starter suppression / allowlist config
@@ -56,12 +58,23 @@ OPENAI_API_KEY=your_openai_api_key
 TARGET_REPO=psf/requests
 OPENAI_MODEL=gpt-4o
 WATCHMAN_DB_PATH=security_findings.db
+WATCHMAN_DATABASE_URL=
 WATCHLIST_PATH=watchlist.txt
 SUPPRESSIONS_PATH=suppressions.json
 EVAL_DATASET_PATH=datasets/eval_dataset.json
 ALERTS_LOG_PATH=alerts/alerts.jsonl
 ALERT_MIN_RISK=high
 ALERT_MIN_CONFIDENCE=80
+WATCHMAN_DEFAULT_TEAM_SLUG=personal-lab
+WATCHMAN_DEFAULT_TEAM_NAME=Personal Lab
+WATCHMAN_DEFAULT_USER_EMAIL=analyst@example.com
+WATCHMAN_DEFAULT_USER_NAME=Local Analyst
+```
+
+Use `WATCHMAN_DB_PATH` for local SQLite or set `WATCHMAN_DATABASE_URL` for PostgreSQL:
+
+```env
+WATCHMAN_DATABASE_URL=postgresql://watchman:secret@localhost:5432/threat_hunter
 ```
 
 ## Usage
@@ -69,7 +82,7 @@ ALERT_MIN_CONFIDENCE=80
 Run the local synthetic test flow:
 
 ```bash
-python3 watchman.py test
+python3 watchman.py --team-slug personal-lab --user-email analyst@example.com test
 ```
 
 Run the analyst inbox and service API:
@@ -83,7 +96,7 @@ Open `http://127.0.0.1:8000` to review findings in the browser.
 Scan a single repository:
 
 ```bash
-python3 watchman.py scan --repo psf/requests --limit 3
+python3 watchman.py --team-slug blue-team --team-name "Blue Team" --user-email analyst@blue.example scan --repo psf/requests --limit 3
 ```
 
 Copy [watchlist.txt.example](/Users/abhijithshaji/Documents/GitSecurity/watchlist.txt.example) to `watchlist.txt`, then scan all watched repos:
@@ -95,10 +108,10 @@ python3 watchman.py scan-watchlist --limit 3
 Review saved findings from the local database:
 
 ```bash
-python3 watchman.py list-findings --risk high
-python3 watchman.py show-finding 1
-python3 watchman.py triage-finding 1 --disposition true_positive --note "Confirmed reverse shell behavior"
-python3 watchman.py list-findings --disposition new
+python3 watchman.py --team-slug blue-team list-findings --risk high
+python3 watchman.py --team-slug blue-team show-finding 1
+python3 watchman.py --team-slug blue-team --user-email analyst@blue.example triage-finding 1 --disposition true_positive --note "Confirmed reverse shell behavior"
+python3 watchman.py --team-slug blue-team list-findings --disposition new
 ```
 
 Run a labeled evaluation dataset to measure quality:
@@ -119,11 +132,21 @@ Noise reduction and alert delivery:
 The repo now includes a product-facing FastAPI service:
 
 - `GET /health`
+- `GET /api/session`
 - `GET /api/findings`
 - `GET /api/findings/{id}`
 - `POST /api/findings/{id}/triage`
 - `GET /api/alerts`
 - `POST /api/demo/test-scan`
+
+The service accepts team/user context through query params or headers:
+
+- `X-Team-Slug`
+- `X-Team-Name`
+- `X-User-Email`
+- `X-User-Name`
+
+That lets one deployment keep findings separated by team even before a full auth system exists.
 
 The browser dashboard at `/` provides:
 
@@ -132,6 +155,8 @@ The browser dashboard at `/` provides:
 - triage updates
 - alert inbox visibility
 - a one-click synthetic demo scan
+- team and analyst context in the UI
+- backend visibility so you can tell whether the app is using SQLite or PostgreSQL
 
 Historical context is automatically applied during analysis when prior findings exist for the same repo/file and matching rule hits:
 
@@ -157,16 +182,31 @@ pytest
 python -m compileall watchman.py testThreat.py tests
 ```
 
-## Persistence
+## Persistence And Ownership
 
-Findings are stored in SQLite across two tables:
+Findings are stored behind an abstract store layer:
 
-- `commits`: repo, commit SHA, author, message, URL, analysis timestamp
-- `findings`: file name, risk, confidence, summary, reasons, indicators, rule hits, YARA, raw model response, disposition, analyst note, triage timestamp
-- `findings` also store historical context used to adjust the final score
-- `findings` also store suppression context used to explain why an alert was reduced
+- `storage.py` selects SQLite or PostgreSQL at runtime
+- `teams`, `users`, and `team_memberships` establish ownership
+- `commits` are scoped by `team_id + repo_name + commit_sha`
+- `findings` store:
+  - file name
+  - risk
+  - confidence
+  - summary
+  - reasons
+  - indicators
+  - rule hits
+  - YARA
+  - raw model response
+  - disposition
+  - analyst note
+  - triage timestamp
+  - triaging user identity
+  - historical context
+  - suppression context
 
-This makes it much easier to build a dashboard, alerting workflow, or evaluation pipeline on top of the scanner.
+This is the first step from a single-user demo toward a real multi-user product backend.
 
 ## v0.2 additions
 
@@ -182,3 +222,5 @@ This version adds a few product-oriented building blocks:
 - evaluation datasets and CLI reporting to measure true/false positives and negatives
 - alert delivery to a local alert inbox plus optional webhook
 - FastAPI service and analyst inbox as the first product-facing surface
+- abstract store layer with PostgreSQL support
+- team and analyst ownership threaded through scans, findings, and triage

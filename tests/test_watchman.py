@@ -3,11 +3,13 @@ import tempfile
 from pathlib import Path
 
 import watchman
+from storage import infer_backend_name
 from testThreat import FAKE_PATCH
 from watchman import (
     DetectionResult,
     FindingStore,
     ThreatHunter,
+    default_ownership_context,
     deliver_alert,
     load_evaluation_dataset,
     load_suppressions,
@@ -15,12 +17,27 @@ from watchman import (
 )
 
 
-def build_test_hunter(tmp_path: Path) -> ThreatHunter:
+def ownership(
+    team_slug: str = "alpha-team",
+    team_name: str = "Alpha Team",
+    user_email: str = "analyst@alpha.example",
+    user_name: str = "Alpha Analyst",
+):
+    return default_ownership_context(
+        team_slug=team_slug,
+        team_name=team_name,
+        user_email=user_email,
+        user_name=user_name,
+    )
+
+
+def build_test_hunter(tmp_path: Path, team_slug: str = "alpha-team") -> ThreatHunter:
     return ThreatHunter(
         github_token="test-token",
         openai_api_key="test-key",
         db_path=tmp_path / "findings.db",
         model="gpt-4o",
+        ownership=ownership(team_slug=team_slug, team_name=team_slug.replace("-", " ").title()),
     )
 
 
@@ -67,43 +84,86 @@ def test_run_prechecks_detects_reverse_shell(tmp_path: Path) -> None:
     assert "/bin/sh" in result.indicators
 
 
-def test_finding_store_saves_commit_and_finding(tmp_path: Path) -> None:
+def test_finding_store_saves_commit_and_finding_with_team_context(tmp_path: Path) -> None:
     store = FindingStore(tmp_path / "findings.db")
+    team = ownership()
     store.save_commit_metadata(
+        ownership=team,
         repo_name="psf/requests",
         commit_sha="abc123",
         author_name="alice",
         commit_message="suspicious change",
         html_url="https://example.com/commit/abc123",
     )
-    result = DetectionResult(
-        risk="medium",
-        confidence=77,
-        summary="Suspicious subprocess usage.",
-        reasons=["launches shell"],
-        indicators=["subprocess", "/bin/sh"],
-        yara_rule="rule suspicious_shell { condition: true }",
-        raw_response='{"risk":"medium"}',
-        rule_hits=["shell-spawn"],
+    finding_id = store.save_finding(
+        ownership=team,
+        repo_name="psf/requests",
+        commit_sha="abc123",
+        file_name="requests/api.py",
+        result=DetectionResult(
+            risk="medium",
+            confidence=77,
+            summary="Suspicious subprocess usage.",
+            reasons=["launches shell"],
+            indicators=["subprocess", "/bin/sh"],
+            yara_rule="rule suspicious_shell { condition: true }",
+            raw_response='{"risk":"medium"}',
+            rule_hits=["shell-spawn"],
+        ),
     )
 
-    store.save_finding("abc123", "requests/api.py", result)
+    row = store.get_finding(team, finding_id)
 
-    with store._connect() as connection:
-        commit = connection.execute("SELECT repo_name, commit_sha FROM commits").fetchone()
-        finding = connection.execute(
-            "SELECT file_name, risk, confidence, summary, rule_hits_json, disposition, analyst_note, history_context_json FROM findings"
-        ).fetchone()
+    assert row is not None
+    assert row["repo_name"] == "psf/requests"
+    assert row["commit_sha"] == "abc123"
+    assert row["file_name"] == "requests/api.py"
+    assert row["risk"] == "medium"
+    assert row["confidence"] == 77
+    assert json.loads(row["rule_hits_json"]) == ["shell-spawn"]
+    assert row["disposition"] == "new"
+    assert row["analyst_note"] == ""
+    assert json.loads(row["history_context_json"]) == {}
+    assert row["team_slug"] == "alpha-team"
 
-    assert commit["repo_name"] == "psf/requests"
-    assert commit["commit_sha"] == "abc123"
-    assert finding["file_name"] == "requests/api.py"
-    assert finding["risk"] == "medium"
-    assert finding["confidence"] == 77
-    assert json.loads(finding["rule_hits_json"]) == ["shell-spawn"]
-    assert finding["disposition"] == "new"
-    assert finding["analyst_note"] == ""
-    assert json.loads(finding["history_context_json"]) == {}
+
+def test_store_scopes_same_commit_sha_per_team(tmp_path: Path) -> None:
+    store = FindingStore(tmp_path / "findings.db")
+    alpha = ownership(team_slug="alpha", team_name="Alpha", user_email="a@alpha.test", user_name="Alice")
+    bravo = ownership(team_slug="bravo", team_name="Bravo", user_email="b@bravo.test", user_name="Bob")
+
+    for team in (alpha, bravo):
+        store.save_commit_metadata(
+            ownership=team,
+            repo_name="psf/requests",
+            commit_sha="shared-sha",
+            author_name="robot",
+            commit_message="same commit in different tenant",
+            html_url=None,
+        )
+        store.save_finding(
+            ownership=team,
+            repo_name="psf/requests",
+            commit_sha="shared-sha",
+            file_name="requests/api.py",
+            result=DetectionResult(
+                risk="high",
+                confidence=90,
+                summary=f"Finding for {team.team_slug}",
+                reasons=["launches shell"],
+                indicators=["subprocess", "/bin/sh"],
+                rule_hits=["shell-spawn"],
+            ),
+        )
+
+    alpha_rows = store.list_findings(alpha, limit=10)
+    bravo_rows = store.list_findings(bravo, limit=10)
+
+    assert len(alpha_rows) == 1
+    assert len(bravo_rows) == 1
+    assert alpha_rows[0]["team_slug"] == "alpha"
+    assert bravo_rows[0]["team_slug"] == "bravo"
+    assert alpha_rows[0]["id"] != bravo_rows[0]["id"]
 
 
 def test_save_yara_rule_creates_file(tmp_path: Path) -> None:
@@ -185,19 +245,23 @@ def test_load_evaluation_dataset_reads_cases(tmp_path: Path) -> None:
     assert cases[0]["id"] == "mal-001"
 
 
-def test_update_finding_triage_sets_disposition_and_note(tmp_path: Path) -> None:
+def test_update_finding_triage_sets_disposition_note_and_triager(tmp_path: Path) -> None:
     store = FindingStore(tmp_path / "findings.db")
+    team = ownership()
     store.save_commit_metadata(
+        ownership=team,
         repo_name="psf/requests",
         commit_sha="abc124",
         author_name="alice",
         commit_message="another suspicious change",
         html_url="https://example.com/commit/abc124",
     )
-    store.save_finding(
-        "abc124",
-        "requests/api.py",
-        DetectionResult(
+    finding_id = store.save_finding(
+        ownership=team,
+        repo_name="psf/requests",
+        commit_sha="abc124",
+        file_name="requests/api.py",
+        result=DetectionResult(
             risk="high",
             confidence=92,
             summary="High-risk shell execution.",
@@ -208,17 +272,19 @@ def test_update_finding_triage_sets_disposition_and_note(tmp_path: Path) -> None
     )
 
     updated = store.update_finding_triage(
-        1,
+        ownership=team,
+        finding_id=finding_id,
         disposition="true_positive",
         analyst_note="Confirmed reverse shell behavior.",
     )
 
     assert updated is True
-    row = store.get_finding(1)
+    row = store.get_finding(team, finding_id)
     assert row is not None
     assert row["disposition"] == "true_positive"
     assert row["analyst_note"] == "Confirmed reverse shell behavior."
     assert row["triaged_at"] is not None
+    assert row["triaged_by_user_email"] == team.user_email
 
 
 def test_history_context_reduces_risk_after_false_positive(tmp_path: Path) -> None:
@@ -227,8 +293,10 @@ def test_history_context_reduces_risk_after_false_positive(tmp_path: Path) -> No
         openai_api_key=None,
         db_path=tmp_path / "findings.db",
         model="gpt-4o",
+        ownership=ownership(),
     )
     hunter.store.save_commit_metadata(
+        ownership=hunter.ownership,
         repo_name="psf/requests",
         commit_sha="hist001",
         author_name="alice",
@@ -236,9 +304,11 @@ def test_history_context_reduces_risk_after_false_positive(tmp_path: Path) -> No
         html_url=None,
     )
     hunter.store.save_finding(
-        "hist001",
-        "requests/api.py",
-        DetectionResult(
+        ownership=hunter.ownership,
+        repo_name="psf/requests",
+        commit_sha="hist001",
+        file_name="requests/api.py",
+        result=DetectionResult(
             risk="high",
             confidence=90,
             summary="Older shell spawn.",
@@ -247,7 +317,12 @@ def test_history_context_reduces_risk_after_false_positive(tmp_path: Path) -> No
             rule_hits=["shell-spawn"],
         ),
     )
-    hunter.store.update_finding_triage(1, disposition="false_positive", analyst_note="known admin helper")
+    hunter.store.update_finding_triage(
+        ownership=hunter.ownership,
+        finding_id=1,
+        disposition="false_positive",
+        analyst_note="known admin helper",
+    )
 
     result = hunter.apply_history_context(
         repo_name="psf/requests",
@@ -275,8 +350,10 @@ def test_history_context_reinforces_confidence_after_true_positive(tmp_path: Pat
         openai_api_key=None,
         db_path=tmp_path / "findings.db",
         model="gpt-4o",
+        ownership=ownership(),
     )
     hunter.store.save_commit_metadata(
+        ownership=hunter.ownership,
         repo_name="psf/requests",
         commit_sha="hist002",
         author_name="alice",
@@ -284,9 +361,11 @@ def test_history_context_reinforces_confidence_after_true_positive(tmp_path: Pat
         html_url=None,
     )
     hunter.store.save_finding(
-        "hist002",
-        "requests/api.py",
-        DetectionResult(
+        ownership=hunter.ownership,
+        repo_name="psf/requests",
+        commit_sha="hist002",
+        file_name="requests/api.py",
+        result=DetectionResult(
             risk="high",
             confidence=91,
             summary="Older reverse shell.",
@@ -295,7 +374,12 @@ def test_history_context_reinforces_confidence_after_true_positive(tmp_path: Pat
             rule_hits=["reverse-shell-pattern"],
         ),
     )
-    hunter.store.update_finding_triage(1, disposition="true_positive", analyst_note="confirmed malicious")
+    hunter.store.update_finding_triage(
+        ownership=hunter.ownership,
+        finding_id=1,
+        disposition="true_positive",
+        analyst_note="confirmed malicious",
+    )
 
     result = hunter.apply_history_context(
         repo_name="psf/requests",
@@ -331,6 +415,7 @@ def test_suppression_rules_reduce_known_safe_pattern(tmp_path: Path) -> None:
                 "rule_hits": ["shell-spawn"],
             }
         ],
+        ownership=ownership(),
     )
 
     result = hunter.analyze_patch(
@@ -351,6 +436,7 @@ def test_evaluate_cases_reports_expected_labels(tmp_path: Path) -> None:
         openai_api_key=None,
         db_path=tmp_path / "findings.db",
         model="gpt-4o",
+        ownership=ownership(),
     )
 
     results = hunter.evaluate_cases(
@@ -387,6 +473,7 @@ def test_deliver_alert_writes_jsonl_log(tmp_path: Path) -> None:
         watchman.ALERT_MIN_CONFIDENCE = 80
 
         delivery = deliver_alert(
+            ownership=ownership(),
             repo_name="psf/requests",
             commit_sha="alert001",
             file_name="requests/api.py",
@@ -405,6 +492,7 @@ def test_deliver_alert_writes_jsonl_log(tmp_path: Path) -> None:
         payload = json.loads(watchman.ALERTS_LOG_PATH.read_text(encoding="utf-8").strip())
         assert payload["commit_sha"] == "alert001"
         assert payload["risk"] == "high"
+        assert payload["team_slug"] == "alpha-team"
     finally:
         watchman.ALERTS_LOG_PATH = original_path
         watchman.ALERT_MIN_RISK = original_risk
@@ -416,6 +504,7 @@ def test_deliver_alert_skips_suppressed_findings(tmp_path: Path) -> None:
     try:
         watchman.ALERTS_LOG_PATH = tmp_path / "alerts.jsonl"
         delivery = deliver_alert(
+            ownership=ownership(),
             repo_name="psf/requests",
             commit_sha="alert002",
             file_name="requests/api.py",
@@ -431,3 +520,8 @@ def test_deliver_alert_skips_suppressed_findings(tmp_path: Path) -> None:
         assert watchman.ALERTS_LOG_PATH.exists() is False
     finally:
         watchman.ALERTS_LOG_PATH = original_path
+
+
+def test_infer_backend_name_supports_postgres_urls() -> None:
+    assert infer_backend_name("postgresql://watchman:secret@localhost/threathunter", None) == "postgresql"
+    assert infer_backend_name(None, Path("security_findings.db")) == "sqlite"
