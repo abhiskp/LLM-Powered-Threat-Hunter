@@ -4,7 +4,9 @@ import sqlite3
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 from pathlib import Path
+import secrets
 from typing import Any, Dict, List, Optional
 
 try:
@@ -34,6 +36,16 @@ class OwnershipRecord:
     user_id: int
     user_email: str
     user_name: str
+
+
+@dataclass(frozen=True)
+class RepoWatchlistRecord:
+    id: int
+    team_id: int
+    repo_name: str
+    is_active: bool
+    created_at: str
+    last_scanned_at: Optional[str]
 
 
 def utc_now_iso() -> str:
@@ -71,6 +83,30 @@ class BaseStoreBackend(ABC):
 
     @abstractmethod
     def resolve_ownership(self, context: OwnershipContext) -> OwnershipRecord:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_membership(self, team_slug: str, user_email: str) -> Optional[OwnershipRecord]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def register_account(
+        self,
+        team_slug: str,
+        team_name: str,
+        user_email: str,
+        user_name: str,
+        password: str,
+    ) -> OwnershipRecord:
+        raise NotImplementedError
+
+    @abstractmethod
+    def authenticate_account(
+        self,
+        team_slug: str,
+        user_email: str,
+        password: str,
+    ) -> Optional[OwnershipRecord]:
         raise NotImplementedError
 
     @abstractmethod
@@ -142,6 +178,30 @@ class BaseStoreBackend(ABC):
     ) -> bool:
         raise NotImplementedError
 
+    @abstractmethod
+    def list_repo_watchlists(
+        self,
+        ownership: OwnershipContext,
+        include_inactive: bool = False,
+    ) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def add_repo_watchlist(
+        self,
+        ownership: OwnershipContext,
+        repo_name: str,
+    ) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def deactivate_repo_watchlist(
+        self,
+        ownership: OwnershipContext,
+        watchlist_id: int,
+    ) -> bool:
+        raise NotImplementedError
+
 
 class SQLiteStoreBackend(BaseStoreBackend):
     backend_name = "sqlite"
@@ -171,6 +231,8 @@ class SQLiteStoreBackend(BaseStoreBackend):
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     email TEXT NOT NULL UNIQUE,
                     display_name TEXT NOT NULL,
+                    password_salt TEXT,
+                    password_hash TEXT,
                     created_at TEXT NOT NULL
                 );
 
@@ -275,6 +337,11 @@ class SQLiteStoreBackend(BaseStoreBackend):
             connection.execute("ALTER TABLE findings ADD COLUMN suppression_context_json TEXT NOT NULL DEFAULT '{}'")
         if "triaged_by_user_id" not in finding_columns:
             connection.execute("ALTER TABLE findings ADD COLUMN triaged_by_user_id INTEGER")
+        user_columns = self._table_columns(connection, "users")
+        if "password_salt" not in user_columns:
+            connection.execute("ALTER TABLE users ADD COLUMN password_salt TEXT")
+        if "password_hash" not in user_columns:
+            connection.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
 
     @staticmethod
     def _table_columns(connection: sqlite3.Connection, table_name: str) -> List[str]:
@@ -342,6 +409,139 @@ class SQLiteStoreBackend(BaseStoreBackend):
             user_email=str(user["email"]),
             user_name=str(user["display_name"]),
         )
+
+    def get_membership(self, team_slug: str, user_email: str) -> Optional[OwnershipRecord]:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    teams.id AS team_id,
+                    teams.slug AS team_slug,
+                    teams.name AS team_name,
+                    users.id AS user_id,
+                    users.email AS user_email,
+                    users.display_name AS user_name
+                FROM team_memberships
+                JOIN teams ON team_memberships.team_id = teams.id
+                JOIN users ON team_memberships.user_id = users.id
+                WHERE teams.slug = ? AND users.email = ?
+                """,
+                (team_slug, user_email),
+            ).fetchone()
+        if row is None:
+            return None
+        return OwnershipRecord(
+            team_id=int(row["team_id"]),
+            team_slug=str(row["team_slug"]),
+            team_name=str(row["team_name"]),
+            user_id=int(row["user_id"]),
+            user_email=str(row["user_email"]),
+            user_name=str(row["user_name"]),
+        )
+
+    def register_account(
+        self,
+        team_slug: str,
+        team_name: str,
+        user_email: str,
+        user_name: str,
+        password: str,
+    ) -> OwnershipRecord:
+        normalized_team_slug = team_slug.strip()
+        normalized_team_name = team_name.strip()
+        normalized_email = user_email.strip().lower()
+        normalized_user_name = user_name.strip()
+        ensure_password_strength(password)
+
+        with self._connect() as connection:
+            existing_team = connection.execute(
+                "SELECT id FROM teams WHERE slug = ?",
+                (normalized_team_slug,),
+            ).fetchone()
+            if existing_team is not None:
+                raise ValueError("Team slug is already in use.")
+
+            existing_user = connection.execute(
+                "SELECT id, password_salt, password_hash FROM users WHERE email = ?",
+                (normalized_email,),
+            ).fetchone()
+
+            if existing_user is None:
+                salt = generate_password_salt()
+                password_hash = hash_password(password, salt)
+                connection.execute(
+                    """
+                    INSERT INTO users (email, display_name, password_salt, password_hash, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (normalized_email, normalized_user_name, salt, password_hash, utc_now_iso()),
+                )
+                existing_user = connection.execute(
+                    "SELECT id, password_salt, password_hash FROM users WHERE email = ?",
+                    (normalized_email,),
+                ).fetchone()
+            else:
+                stored_salt = existing_user["password_salt"] or ""
+                stored_hash = existing_user["password_hash"] or ""
+                if not stored_salt or not stored_hash:
+                    raise ValueError("This user exists without a login password. Reset support is required.")
+                if hash_password(password, stored_salt) != stored_hash:
+                    raise ValueError("An account with this email already exists.")
+                connection.execute(
+                    "UPDATE users SET display_name = ? WHERE id = ?",
+                    (normalized_user_name, existing_user["id"]),
+                )
+
+            connection.execute(
+                "INSERT INTO teams (slug, name, created_at) VALUES (?, ?, ?)",
+                (normalized_team_slug, normalized_team_name, utc_now_iso()),
+            )
+            team = connection.execute(
+                "SELECT id, slug, name FROM teams WHERE slug = ?",
+                (normalized_team_slug,),
+            ).fetchone()
+            user = connection.execute(
+                "SELECT id, email, display_name FROM users WHERE email = ?",
+                (normalized_email,),
+            ).fetchone()
+            connection.execute(
+                """
+                INSERT INTO team_memberships (team_id, user_id, role, created_at)
+                VALUES (?, ?, 'owner', ?)
+                """,
+                (team["id"], user["id"], utc_now_iso()),
+            )
+
+        return OwnershipRecord(
+            team_id=int(team["id"]),
+            team_slug=str(team["slug"]),
+            team_name=str(team["name"]),
+            user_id=int(user["id"]),
+            user_email=str(user["email"]),
+            user_name=str(user["display_name"]),
+        )
+
+    def authenticate_account(
+        self,
+        team_slug: str,
+        user_email: str,
+        password: str,
+    ) -> Optional[OwnershipRecord]:
+        normalized_email = user_email.strip().lower()
+        with self._connect() as connection:
+            user = connection.execute(
+                "SELECT id, email, display_name, password_salt, password_hash FROM users WHERE email = ?",
+                (normalized_email,),
+            ).fetchone()
+            if user is None:
+                return None
+            stored_salt = user["password_salt"] or ""
+            stored_hash = user["password_hash"] or ""
+            if not stored_salt or not stored_hash:
+                return None
+            if hash_password(password, stored_salt) != stored_hash:
+                return None
+        return self.get_membership(team_slug.strip(), normalized_email)
 
     def commit_exists(self, ownership: OwnershipContext, repo_name: str, commit_sha: str) -> bool:
         resolved = self.resolve_ownership(ownership)
@@ -637,6 +837,69 @@ class SQLiteStoreBackend(BaseStoreBackend):
             )
         return True
 
+    def list_repo_watchlists(
+        self,
+        ownership: OwnershipContext,
+        include_inactive: bool = False,
+    ) -> List[Dict[str, Any]]:
+        resolved = self.resolve_ownership(ownership)
+        query = """
+            SELECT id, team_id, repo_name, is_active, created_at, last_scanned_at
+            FROM repo_watchlists
+            WHERE team_id = ?
+        """
+        params: List[Any] = [resolved.team_id]
+        if not include_inactive:
+            query += " AND is_active = 1"
+        query += " ORDER BY repo_name ASC"
+        with self._connect() as connection:
+            return [dict(row) for row in connection.execute(query, params).fetchall()]
+
+    def add_repo_watchlist(
+        self,
+        ownership: OwnershipContext,
+        repo_name: str,
+    ) -> Dict[str, Any]:
+        normalized_repo = normalize_repo_name(repo_name)
+        resolved = self.resolve_ownership(ownership)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO repo_watchlists (team_id, repo_name, is_active, created_at, last_scanned_at)
+                VALUES (?, ?, 1, ?, NULL)
+                ON CONFLICT(team_id, repo_name) DO UPDATE SET is_active = 1
+                """,
+                (resolved.team_id, normalized_repo, utc_now_iso()),
+            )
+            row = connection.execute(
+                """
+                SELECT id, team_id, repo_name, is_active, created_at, last_scanned_at
+                FROM repo_watchlists
+                WHERE team_id = ? AND repo_name = ?
+                """,
+                (resolved.team_id, normalized_repo),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"Unable to persist watchlist entry for {normalized_repo}")
+        return dict(row)
+
+    def deactivate_repo_watchlist(
+        self,
+        ownership: OwnershipContext,
+        watchlist_id: int,
+    ) -> bool:
+        resolved = self.resolve_ownership(ownership)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE repo_watchlists
+                SET is_active = 0
+                WHERE id = ? AND team_id = ?
+                """,
+                (watchlist_id, resolved.team_id),
+            )
+        return cursor.rowcount > 0
+
     @staticmethod
     def _json(value: Any) -> str:
         return json_dumps(value)
@@ -682,6 +945,8 @@ class PostgresStoreBackend(BaseStoreBackend):
                         id BIGSERIAL PRIMARY KEY,
                         email TEXT NOT NULL UNIQUE,
                         display_name TEXT NOT NULL,
+                        password_salt TEXT,
+                        password_hash TEXT,
                         created_at TEXT NOT NULL
                     );
 
@@ -746,6 +1011,8 @@ class PostgresStoreBackend(BaseStoreBackend):
                     );
                     """
                 )
+                cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_salt TEXT")
+                cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT")
             connection.commit()
 
     def resolve_ownership(self, context: OwnershipContext) -> OwnershipRecord:
@@ -791,6 +1058,149 @@ class PostgresStoreBackend(BaseStoreBackend):
             user_email=str(user["email"]),
             user_name=str(user["display_name"]),
         )
+
+    def get_membership(self, team_slug: str, user_email: str) -> Optional[OwnershipRecord]:
+        query = """
+            SELECT
+                teams.id AS team_id,
+                teams.slug AS team_slug,
+                teams.name AS team_name,
+                users.id AS user_id,
+                users.email AS user_email,
+                users.display_name AS user_name
+            FROM team_memberships
+            JOIN teams ON team_memberships.team_id = teams.id
+            JOIN users ON team_memberships.user_id = users.id
+            WHERE teams.slug = %s AND users.email = %s
+        """
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(query, (team_slug, user_email.lower()))
+                row = cursor.fetchone()
+        if row is None:
+            return None
+        return OwnershipRecord(
+            team_id=int(row["team_id"]),
+            team_slug=str(row["team_slug"]),
+            team_name=str(row["team_name"]),
+            user_id=int(row["user_id"]),
+            user_email=str(row["user_email"]),
+            user_name=str(row["user_name"]),
+        )
+
+    def register_account(
+        self,
+        team_slug: str,
+        team_name: str,
+        user_email: str,
+        user_name: str,
+        password: str,
+    ) -> OwnershipRecord:
+        normalized_team_slug = team_slug.strip()
+        normalized_team_name = team_name.strip()
+        normalized_email = user_email.strip().lower()
+        normalized_user_name = user_name.strip()
+        ensure_password_strength(password)
+
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT id FROM teams WHERE slug = %s", (normalized_team_slug,))
+                if cursor.fetchone() is not None:
+                    raise ValueError("Team slug is already in use.")
+
+                cursor.execute(
+                    """
+                    SELECT id, password_salt, password_hash
+                    FROM users
+                    WHERE email = %s
+                    """,
+                    (normalized_email,),
+                )
+                existing_user = cursor.fetchone()
+                if existing_user is None:
+                    salt = generate_password_salt()
+                    password_hash = hash_password(password, salt)
+                    cursor.execute(
+                        """
+                        INSERT INTO users (email, display_name, password_salt, password_hash, created_at)
+                        VALUES (%s, %s, %s, %s, %s)
+                        RETURNING id, email, display_name
+                        """,
+                        (normalized_email, normalized_user_name, salt, password_hash, utc_now_iso()),
+                    )
+                    user = cursor.fetchone()
+                else:
+                    stored_salt = existing_user["password_salt"] or ""
+                    stored_hash = existing_user["password_hash"] or ""
+                    if not stored_salt or not stored_hash:
+                        raise ValueError("This user exists without a login password. Reset support is required.")
+                    if hash_password(password, stored_salt) != stored_hash:
+                        raise ValueError("An account with this email already exists.")
+                    cursor.execute(
+                        """
+                        UPDATE users
+                        SET display_name = %s
+                        WHERE id = %s
+                        RETURNING id, email, display_name
+                        """,
+                        (normalized_user_name, existing_user["id"]),
+                    )
+                    user = cursor.fetchone()
+
+                cursor.execute(
+                    """
+                    INSERT INTO teams (slug, name, created_at)
+                    VALUES (%s, %s, %s)
+                    RETURNING id, slug, name
+                    """,
+                    (normalized_team_slug, normalized_team_name, utc_now_iso()),
+                )
+                team = cursor.fetchone()
+                cursor.execute(
+                    """
+                    INSERT INTO team_memberships (team_id, user_id, role, created_at)
+                    VALUES (%s, %s, 'owner', %s)
+                    """,
+                    (team["id"], user["id"], utc_now_iso()),
+                )
+            connection.commit()
+
+        return OwnershipRecord(
+            team_id=int(team["id"]),
+            team_slug=str(team["slug"]),
+            team_name=str(team["name"]),
+            user_id=int(user["id"]),
+            user_email=str(user["email"]),
+            user_name=str(user["display_name"]),
+        )
+
+    def authenticate_account(
+        self,
+        team_slug: str,
+        user_email: str,
+        password: str,
+    ) -> Optional[OwnershipRecord]:
+        normalized_email = user_email.strip().lower()
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT password_salt, password_hash
+                    FROM users
+                    WHERE email = %s
+                    """,
+                    (normalized_email,),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            return None
+        stored_salt = row["password_salt"] or ""
+        stored_hash = row["password_hash"] or ""
+        if not stored_salt or not stored_hash:
+            return None
+        if hash_password(password, stored_salt) != stored_hash:
+            return None
+        return self.get_membership(team_slug.strip(), normalized_email)
 
     def commit_exists(self, ownership: OwnershipContext, repo_name: str, commit_sha: str) -> bool:
         resolved = self.resolve_ownership(ownership)
@@ -1072,6 +1482,68 @@ class PostgresStoreBackend(BaseStoreBackend):
             connection.commit()
         return True
 
+    def list_repo_watchlists(
+        self,
+        ownership: OwnershipContext,
+        include_inactive: bool = False,
+    ) -> List[Dict[str, Any]]:
+        resolved = self.resolve_ownership(ownership)
+        query = """
+            SELECT id, team_id, repo_name, is_active, created_at, last_scanned_at
+            FROM repo_watchlists
+            WHERE team_id = %s
+        """
+        params: List[Any] = [resolved.team_id]
+        if not include_inactive:
+            query += " AND is_active = TRUE"
+        query += " ORDER BY repo_name ASC"
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(query, params)
+                return [dict(row) for row in cursor.fetchall()]
+
+    def add_repo_watchlist(
+        self,
+        ownership: OwnershipContext,
+        repo_name: str,
+    ) -> Dict[str, Any]:
+        normalized_repo = normalize_repo_name(repo_name)
+        resolved = self.resolve_ownership(ownership)
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO repo_watchlists (team_id, repo_name, is_active, created_at, last_scanned_at)
+                    VALUES (%s, %s, TRUE, %s, NULL)
+                    ON CONFLICT(team_id, repo_name) DO UPDATE SET is_active = TRUE
+                    RETURNING id, team_id, repo_name, is_active, created_at, last_scanned_at
+                    """,
+                    (resolved.team_id, normalized_repo, utc_now_iso()),
+                )
+                row = cursor.fetchone()
+            connection.commit()
+        return dict(row)
+
+    def deactivate_repo_watchlist(
+        self,
+        ownership: OwnershipContext,
+        watchlist_id: int,
+    ) -> bool:
+        resolved = self.resolve_ownership(ownership)
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE repo_watchlists
+                    SET is_active = FALSE
+                    WHERE id = %s AND team_id = %s
+                    """,
+                    (watchlist_id, resolved.team_id),
+                )
+                updated = cursor.rowcount > 0
+            connection.commit()
+        return updated
+
 
 class FindingStore:
     def __init__(
@@ -1096,6 +1568,36 @@ class FindingStore:
 
 def json_dumps(value: Any) -> str:
     return json.dumps(value)
+
+
+def generate_password_salt() -> str:
+    return secrets.token_hex(16)
+
+
+def hash_password(password: str, salt: str) -> str:
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        200_000,
+    ).hex()
+
+
+def ensure_password_strength(password: str) -> None:
+    if len(password) < 8:
+        raise ValueError("Password must be at least 8 characters long.")
+
+
+def normalize_repo_name(repo_name: str) -> str:
+    normalized = repo_name.strip()
+    if normalized.count("/") != 1:
+        raise ValueError("Repository must be in owner/name format.")
+    owner, repo = normalized.split("/", 1)
+    owner = owner.strip()
+    repo = repo.strip()
+    if not owner or not repo:
+        raise ValueError("Repository must be in owner/name format.")
+    return f"{owner}/{repo}"
 
 
 def build_history_context(

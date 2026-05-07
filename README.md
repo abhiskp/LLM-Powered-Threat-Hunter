@@ -69,6 +69,7 @@ WATCHMAN_DEFAULT_TEAM_SLUG=personal-lab
 WATCHMAN_DEFAULT_TEAM_NAME=Personal Lab
 WATCHMAN_DEFAULT_USER_EMAIL=analyst@example.com
 WATCHMAN_DEFAULT_USER_NAME=Local Analyst
+WATCHMAN_SESSION_SECRET=change-me-in-production
 ```
 
 Use `WATCHMAN_DB_PATH` for local SQLite or set `WATCHMAN_DATABASE_URL` for PostgreSQL:
@@ -92,6 +93,8 @@ uvicorn app:app --reload
 ```
 
 Open `http://127.0.0.1:8000` to review findings in the browser.
+
+The web app now uses signed session cookies. Start by creating a team workspace from `/login`, then sign in and onboard watched repos from the dashboard.
 
 Scan a single repository:
 
@@ -132,21 +135,21 @@ Noise reduction and alert delivery:
 The repo now includes a product-facing FastAPI service:
 
 - `GET /health`
+- `GET /login`
+- `POST /auth/register`
+- `POST /auth/login`
+- `POST /auth/logout`
 - `GET /api/session`
 - `GET /api/findings`
 - `GET /api/findings/{id}`
 - `POST /api/findings/{id}/triage`
 - `GET /api/alerts`
+- `GET /api/watchlist`
+- `POST /api/watchlist`
+- `POST /api/watchlist/{id}/deactivate`
 - `POST /api/demo/test-scan`
 
-The service accepts team/user context through query params or headers:
-
-- `X-Team-Slug`
-- `X-Team-Name`
-- `X-User-Email`
-- `X-User-Name`
-
-That lets one deployment keep findings separated by team even before a full auth system exists.
+The app no longer trusts caller-provided identity headers. Team and user context come from a signed session cookie that is created during login or registration.
 
 The browser dashboard at `/` provides:
 
@@ -155,7 +158,8 @@ The browser dashboard at `/` provides:
 - triage updates
 - alert inbox visibility
 - a one-click synthetic demo scan
-- team and analyst context in the UI
+- authenticated team and analyst context in the UI
+- repo onboarding and watchlist management
 - backend visibility so you can tell whether the app is using SQLite or PostgreSQL
 
 Historical context is automatically applied during analysis when prior findings exist for the same repo/file and matching rule hits:
@@ -188,6 +192,8 @@ Findings are stored behind an abstract store layer:
 
 - `storage.py` selects SQLite or PostgreSQL at runtime
 - `teams`, `users`, and `team_memberships` establish ownership
+- `users` now store password hashes for local account login
+- `repo_watchlists` persist team-owned repository onboarding state
 - `commits` are scoped by `team_id + repo_name + commit_sha`
 - `findings` store:
   - file name
@@ -224,3 +230,5 @@ This version adds a few product-oriented building blocks:
 - FastAPI service and analyst inbox as the first product-facing surface
 - abstract store layer with PostgreSQL support
 - team and analyst ownership threaded through scans, findings, and triage
+- local authentication plus signed sessions for the web app
+- repo watchlist onboarding persisted in the database

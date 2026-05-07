@@ -525,3 +525,78 @@ def test_deliver_alert_skips_suppressed_findings(tmp_path: Path) -> None:
 def test_infer_backend_name_supports_postgres_urls() -> None:
     assert infer_backend_name("postgresql://watchman:secret@localhost/threathunter", None) == "postgresql"
     assert infer_backend_name(None, Path("security_findings.db")) == "sqlite"
+
+
+def test_register_and_authenticate_account_creates_owner_membership(tmp_path: Path) -> None:
+    store = FindingStore(tmp_path / "auth.db")
+
+    record = store.register_account(
+        team_slug="blue-team",
+        team_name="Blue Team",
+        user_email="alice@example.com",
+        user_name="Alice",
+        password="hunterpass123",
+    )
+
+    assert record.team_slug == "blue-team"
+    assert record.user_email == "alice@example.com"
+
+    authenticated = store.authenticate_account(
+        team_slug="blue-team",
+        user_email="alice@example.com",
+        password="hunterpass123",
+    )
+
+    assert authenticated is not None
+    assert authenticated.team_slug == "blue-team"
+    assert authenticated.user_name == "Alice"
+
+
+def test_register_account_rejects_existing_team_slug(tmp_path: Path) -> None:
+    store = FindingStore(tmp_path / "auth.db")
+    store.register_account(
+        team_slug="blue-team",
+        team_name="Blue Team",
+        user_email="alice@example.com",
+        user_name="Alice",
+        password="hunterpass123",
+    )
+
+    try:
+        store.register_account(
+            team_slug="blue-team",
+            team_name="Blue Team 2",
+            user_email="bob@example.com",
+            user_name="Bob",
+            password="hunterpass123",
+        )
+    except ValueError as exc:
+        assert "already in use" in str(exc)
+    else:
+        raise AssertionError("Expected team slug collision to fail")
+
+
+def test_repo_watchlist_add_and_deactivate(tmp_path: Path) -> None:
+    store = FindingStore(tmp_path / "watchlists.db")
+    team = ownership(team_slug="ops", team_name="Ops Team", user_email="ops@example.com", user_name="Olive")
+    store.register_account(
+        team_slug=team.team_slug,
+        team_name=team.team_name,
+        user_email=team.user_email,
+        user_name=team.user_name,
+        password="hunterpass123",
+    )
+
+    first = store.add_repo_watchlist(team, "psf/requests")
+    second = store.add_repo_watchlist(team, "pallets/flask")
+    rows = store.list_repo_watchlists(team)
+
+    assert [row["repo_name"] for row in rows] == ["pallets/flask", "psf/requests"]
+    assert first["id"] != second["id"]
+
+    updated = store.deactivate_repo_watchlist(team, first["id"])
+    assert updated is True
+    active_rows = store.list_repo_watchlists(team)
+    all_rows = store.list_repo_watchlists(team, include_inactive=True)
+    assert [row["repo_name"] for row in active_rows] == ["pallets/flask"]
+    assert len(all_rows) == 2
