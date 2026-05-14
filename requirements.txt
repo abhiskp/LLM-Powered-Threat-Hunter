@@ -1,5 +1,5 @@
 fastapi>=0.128.8
-openai>=2.32.0
+openai>=2.36.0
 PyGithub>=2.9.1
 python-dotenv>=1.0.0
 python-multipart>=0.0.20
