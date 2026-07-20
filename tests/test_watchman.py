@@ -471,6 +471,7 @@ def test_deliver_alert_writes_jsonl_log(tmp_path: Path) -> None:
         watchman.ALERTS_LOG_PATH = tmp_path / "alerts.jsonl"
         watchman.ALERT_MIN_RISK = "high"
         watchman.ALERT_MIN_CONFIDENCE = 80
+        store = FindingStore(tmp_path / "alerts.db")
 
         delivery = deliver_alert(
             ownership=ownership(),
@@ -485,6 +486,7 @@ def test_deliver_alert_writes_jsonl_log(tmp_path: Path) -> None:
                 indicators=["socket", "/bin/sh"],
                 rule_hits=["reverse-shell-pattern"],
             ),
+            store=store,
         )
 
         assert delivery.delivered is True
@@ -493,6 +495,9 @@ def test_deliver_alert_writes_jsonl_log(tmp_path: Path) -> None:
         assert payload["commit_sha"] == "alert001"
         assert payload["risk"] == "high"
         assert payload["team_slug"] == "alpha-team"
+        deliveries = store.list_alert_deliveries(ownership(), limit=5)
+        assert deliveries[0]["channel"] == "log"
+        assert deliveries[0]["status"] == "delivered"
     finally:
         watchman.ALERTS_LOG_PATH = original_path
         watchman.ALERT_MIN_RISK = original_risk
@@ -600,3 +605,90 @@ def test_repo_watchlist_add_and_deactivate(tmp_path: Path) -> None:
     all_rows = store.list_repo_watchlists(team, include_inactive=True)
     assert [row["repo_name"] for row in active_rows] == ["pallets/flask"]
     assert len(all_rows) == 2
+
+
+def test_team_settings_update_and_scan_runs(tmp_path: Path) -> None:
+    store = FindingStore(tmp_path / "operations.db")
+    team = ownership(team_slug="ops", team_name="Ops Team", user_email="ops@example.com", user_name="Olive")
+    store.register_account(
+        team_slug=team.team_slug,
+        team_name=team.team_name,
+        user_email=team.user_email,
+        user_name=team.user_name,
+        password="hunterpass123",
+    )
+    watchlist = store.add_repo_watchlist(team, "psf/requests")
+
+    initial = store.get_team_settings(team)
+    assert initial["alert_min_risk"] == "high"
+    assert initial["scan_limit"] >= 1
+
+    updated = store.update_team_settings(
+        team,
+        alert_webhook_url="https://hooks.example.test/alerts",
+        alert_min_risk="medium",
+        alert_min_confidence=65,
+        scans_enabled=False,
+        scan_limit=7,
+        scan_interval_minutes=45,
+    )
+    assert updated["alert_webhook_url"] == "https://hooks.example.test/alerts"
+    assert updated["alert_min_risk"] == "medium"
+    assert updated["alert_min_confidence"] == 65
+    assert updated["scans_enabled"] is False
+    assert updated["scan_limit"] == 7
+    assert updated["scan_interval_minutes"] == 45
+
+    scan_run_id = store.create_scan_run(team, watchlist["id"], "psf/requests", "manual")
+    completed = store.complete_scan_run(
+        team,
+        scan_run_id,
+        status="completed",
+        findings_created=3,
+        high_risk_findings=1,
+    )
+    assert completed is True
+
+    runs = store.list_scan_runs(team, limit=5)
+    assert runs[0]["id"] == scan_run_id
+    assert runs[0]["status"] == "completed"
+    assert runs[0]["findings_created"] == 3
+    assert runs[0]["high_risk_findings"] == 1
+    assert runs[0]["lock_expires_at"] is None
+
+    target = store.list_scan_targets(team_slug="ops")[0]
+    assert target["repo_name"] == "psf/requests"
+    assert target["scans_enabled"] is False
+    assert target["scan_limit"] == 7
+    assert target["scan_interval_minutes"] == 45
+
+    watchlist_row = store.get_repo_watchlist(team, watchlist["id"])
+    assert watchlist_row is not None
+    assert watchlist_row["last_successful_scan_at"] is not None
+    assert watchlist_row["next_scan_at"] is not None
+    assert watchlist_row["last_scan_error"] == ""
+
+
+def test_claim_scan_run_blocks_overlap_until_completion(tmp_path: Path) -> None:
+    store = FindingStore(tmp_path / "scan-locks.db")
+    team = ownership(team_slug="ops", team_name="Ops Team", user_email="ops@example.com", user_name="Olive")
+    store.register_account(
+        team_slug=team.team_slug,
+        team_name=team.team_name,
+        user_email=team.user_email,
+        user_name=team.user_name,
+        password="hunterpass123",
+    )
+    watchlist = store.add_repo_watchlist(team, "psf/requests")
+
+    first = store.claim_scan_run(team, watchlist["id"], "psf/requests", "manual")
+    second = store.claim_scan_run(team, watchlist["id"], "psf/requests", "manual")
+
+    assert first is not None
+    assert second is None
+
+    completed = store.complete_scan_run(team, int(first["id"]), status="completed")
+    assert completed is True
+
+    third = store.claim_scan_run(team, watchlist["id"], "psf/requests", "manual")
+    assert third is not None
