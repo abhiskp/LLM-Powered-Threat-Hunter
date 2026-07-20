@@ -3,7 +3,7 @@ import os
 import sqlite3
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 from pathlib import Path
 import secrets
@@ -46,6 +46,13 @@ class RepoWatchlistRecord:
     is_active: bool
     created_at: str
     last_scanned_at: Optional[str]
+
+
+DEFAULT_ALERT_MIN_RISK = os.getenv("ALERT_MIN_RISK", "high").strip().lower()
+DEFAULT_ALERT_MIN_CONFIDENCE = int(os.getenv("ALERT_MIN_CONFIDENCE", "80"))
+DEFAULT_SCAN_LIMIT = int(os.getenv("WATCHMAN_SCAN_LIMIT", "3"))
+DEFAULT_SCAN_INTERVAL_MINUTES = int(os.getenv("WATCHMAN_SCAN_INTERVAL_MINUTES", "60"))
+DEFAULT_SCAN_LOCK_MINUTES = int(os.getenv("WATCHMAN_SCAN_LOCK_MINUTES", "30"))
 
 
 def utc_now_iso() -> str:
@@ -202,6 +209,104 @@ class BaseStoreBackend(ABC):
     ) -> bool:
         raise NotImplementedError
 
+    @abstractmethod
+    def get_team_settings(self, ownership: OwnershipContext) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def update_team_settings(
+        self,
+        ownership: OwnershipContext,
+        *,
+        alert_webhook_url: Optional[str] = None,
+        alert_min_risk: Optional[str] = None,
+        alert_min_confidence: Optional[int] = None,
+        scans_enabled: Optional[bool] = None,
+        scan_limit: Optional[int] = None,
+        scan_interval_minutes: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def create_scan_run(
+        self,
+        ownership: OwnershipContext,
+        repo_watchlist_id: int,
+        repo_name: str,
+        trigger_mode: str,
+    ) -> int:
+        raise NotImplementedError
+
+    @abstractmethod
+    def complete_scan_run(
+        self,
+        ownership: OwnershipContext,
+        scan_run_id: int,
+        *,
+        status: str,
+        findings_created: int = 0,
+        high_risk_findings: int = 0,
+        error_message: Optional[str] = None,
+    ) -> bool:
+        raise NotImplementedError
+
+    @abstractmethod
+    def list_scan_runs(
+        self,
+        ownership: OwnershipContext,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def claim_scan_run(
+        self,
+        ownership: OwnershipContext,
+        repo_watchlist_id: int,
+        repo_name: str,
+        trigger_mode: str,
+        lock_timeout_minutes: int = DEFAULT_SCAN_LOCK_MINUTES,
+    ) -> Optional[Dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_repo_watchlist(
+        self,
+        ownership: OwnershipContext,
+        watchlist_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def list_scan_targets(
+        self,
+        *,
+        team_slug: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def record_alert_delivery(
+        self,
+        ownership: OwnershipContext,
+        repo_name: str,
+        commit_sha: str,
+        file_name: str,
+        channel: str,
+        destination: str,
+        status: str,
+        error_message: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def list_alert_deliveries(
+        self,
+        ownership: OwnershipContext,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
 
 class SQLiteStoreBackend(BaseStoreBackend):
     backend_name = "sqlite"
@@ -295,7 +400,58 @@ class SQLiteStoreBackend(BaseStoreBackend):
                     is_active INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     last_scanned_at TEXT,
+                    scan_interval_minutes INTEGER NOT NULL DEFAULT 60,
+                    next_scan_at TEXT,
+                    last_successful_scan_at TEXT,
+                    last_failed_scan_at TEXT,
+                    last_scan_error TEXT NOT NULL DEFAULT '',
                     UNIQUE(team_id, repo_name),
+                    FOREIGN KEY(team_id) REFERENCES teams(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS team_settings (
+                    team_id INTEGER PRIMARY KEY,
+                    alert_webhook_url TEXT,
+                    alert_min_risk TEXT NOT NULL DEFAULT 'high',
+                    alert_min_confidence INTEGER NOT NULL DEFAULT 80,
+                    scans_enabled INTEGER NOT NULL DEFAULT 1,
+                    scan_limit INTEGER NOT NULL DEFAULT 3,
+                    scan_interval_minutes INTEGER NOT NULL DEFAULT 60,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(team_id) REFERENCES teams(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS scan_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    team_id INTEGER NOT NULL,
+                    repo_watchlist_id INTEGER NOT NULL,
+                    repo_name TEXT NOT NULL,
+                    trigger_mode TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    lock_expires_at TEXT,
+                    completed_at TEXT,
+                    error_message TEXT,
+                    findings_created INTEGER NOT NULL DEFAULT 0,
+                    high_risk_findings INTEGER NOT NULL DEFAULT 0,
+                    scanner_user_id INTEGER,
+                    FOREIGN KEY(team_id) REFERENCES teams(id),
+                    FOREIGN KEY(repo_watchlist_id) REFERENCES repo_watchlists(id),
+                    FOREIGN KEY(scanner_user_id) REFERENCES users(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS alert_deliveries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    team_id INTEGER NOT NULL,
+                    repo_name TEXT NOT NULL,
+                    commit_sha TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    channel TEXT NOT NULL,
+                    destination TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempt_number INTEGER NOT NULL DEFAULT 1,
+                    error_message TEXT,
+                    created_at TEXT NOT NULL,
                     FOREIGN KEY(team_id) REFERENCES teams(id)
                 );
 
@@ -305,6 +461,13 @@ class SQLiteStoreBackend(BaseStoreBackend):
                     ON findings(team_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_findings_commit
                     ON findings(commit_id);
+                CREATE INDEX IF NOT EXISTS idx_scan_runs_team_started
+                    ON scan_runs(team_id, started_at DESC);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_runs_running_lock
+                    ON scan_runs(team_id, repo_watchlist_id)
+                    WHERE status = 'running';
+                CREATE INDEX IF NOT EXISTS idx_alert_deliveries_team_created
+                    ON alert_deliveries(team_id, created_at DESC);
                 """
             )
             self._migrate_existing_schema(connection)
@@ -342,6 +505,100 @@ class SQLiteStoreBackend(BaseStoreBackend):
             connection.execute("ALTER TABLE users ADD COLUMN password_salt TEXT")
         if "password_hash" not in user_columns:
             connection.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
+        repo_watchlist_columns = self._table_columns(connection, "repo_watchlists")
+        if repo_watchlist_columns:
+            if "scan_interval_minutes" not in repo_watchlist_columns:
+                connection.execute(
+                    "ALTER TABLE repo_watchlists ADD COLUMN scan_interval_minutes INTEGER NOT NULL DEFAULT 60"
+                )
+            if "next_scan_at" not in repo_watchlist_columns:
+                connection.execute("ALTER TABLE repo_watchlists ADD COLUMN next_scan_at TEXT")
+            if "last_successful_scan_at" not in repo_watchlist_columns:
+                connection.execute("ALTER TABLE repo_watchlists ADD COLUMN last_successful_scan_at TEXT")
+            if "last_failed_scan_at" not in repo_watchlist_columns:
+                connection.execute("ALTER TABLE repo_watchlists ADD COLUMN last_failed_scan_at TEXT")
+            if "last_scan_error" not in repo_watchlist_columns:
+                connection.execute(
+                    "ALTER TABLE repo_watchlists ADD COLUMN last_scan_error TEXT NOT NULL DEFAULT ''"
+                )
+        team_settings_columns = self._table_columns(connection, "team_settings")
+        if team_settings_columns:
+            if "alert_webhook_url" not in team_settings_columns:
+                connection.execute("ALTER TABLE team_settings ADD COLUMN alert_webhook_url TEXT")
+            if "alert_min_risk" not in team_settings_columns:
+                connection.execute(
+                    "ALTER TABLE team_settings ADD COLUMN alert_min_risk TEXT NOT NULL DEFAULT 'high'"
+                )
+            if "alert_min_confidence" not in team_settings_columns:
+                connection.execute(
+                    "ALTER TABLE team_settings ADD COLUMN alert_min_confidence INTEGER NOT NULL DEFAULT 80"
+                )
+            if "scans_enabled" not in team_settings_columns:
+                connection.execute(
+                    "ALTER TABLE team_settings ADD COLUMN scans_enabled INTEGER NOT NULL DEFAULT 1"
+                )
+            if "scan_limit" not in team_settings_columns:
+                connection.execute(
+                    "ALTER TABLE team_settings ADD COLUMN scan_limit INTEGER NOT NULL DEFAULT 3"
+                )
+            if "scan_interval_minutes" not in team_settings_columns:
+                connection.execute(
+                    "ALTER TABLE team_settings ADD COLUMN scan_interval_minutes INTEGER NOT NULL DEFAULT 60"
+                )
+            if "updated_at" not in team_settings_columns:
+                connection.execute(
+                    "ALTER TABLE team_settings ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''"
+                )
+        scan_run_columns = self._table_columns(connection, "scan_runs")
+        if scan_run_columns and "lock_expires_at" not in scan_run_columns:
+            connection.execute("ALTER TABLE scan_runs ADD COLUMN lock_expires_at TEXT")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS alert_deliveries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                team_id INTEGER NOT NULL,
+                repo_name TEXT NOT NULL,
+                commit_sha TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempt_number INTEGER NOT NULL DEFAULT 1,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(team_id) REFERENCES teams(id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_runs_running_lock
+                ON scan_runs(team_id, repo_watchlist_id)
+                WHERE status = 'running'
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_alert_deliveries_team_created
+                ON alert_deliveries(team_id, created_at DESC)
+            """
+        )
+        connection.execute(
+            """
+            UPDATE repo_watchlists
+            SET scan_interval_minutes = COALESCE(scan_interval_minutes, ?),
+                next_scan_at = COALESCE(next_scan_at, created_at, ?),
+                last_scan_error = COALESCE(last_scan_error, '')
+            """,
+            (DEFAULT_SCAN_INTERVAL_MINUTES, utc_now_iso()),
+        )
+        connection.execute(
+            """
+            UPDATE team_settings
+            SET scan_interval_minutes = COALESCE(scan_interval_minutes, ?)
+            """,
+            (DEFAULT_SCAN_INTERVAL_MINUTES,),
+        )
 
     @staticmethod
     def _table_columns(connection: sqlite3.Connection, table_name: str) -> List[str]:
@@ -409,6 +666,34 @@ class SQLiteStoreBackend(BaseStoreBackend):
             user_email=str(user["email"]),
             user_name=str(user["display_name"]),
         )
+
+    def _ensure_team_settings_row(self, resolved: OwnershipRecord) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO team_settings (
+                    team_id,
+                    alert_webhook_url,
+                    alert_min_risk,
+                    alert_min_confidence,
+                    scans_enabled,
+                    scan_limit,
+                    scan_interval_minutes,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    resolved.team_id,
+                    None,
+                    DEFAULT_ALERT_MIN_RISK,
+                    DEFAULT_ALERT_MIN_CONFIDENCE,
+                    1,
+                    DEFAULT_SCAN_LIMIT,
+                    DEFAULT_SCAN_INTERVAL_MINUTES,
+                    utc_now_iso(),
+                ),
+            )
 
     def get_membership(self, team_slug: str, user_email: str) -> Optional[OwnershipRecord]:
         with self._connect() as connection:
@@ -844,7 +1129,18 @@ class SQLiteStoreBackend(BaseStoreBackend):
     ) -> List[Dict[str, Any]]:
         resolved = self.resolve_ownership(ownership)
         query = """
-            SELECT id, team_id, repo_name, is_active, created_at, last_scanned_at
+            SELECT
+                id,
+                team_id,
+                repo_name,
+                is_active,
+                created_at,
+                last_scanned_at,
+                scan_interval_minutes,
+                next_scan_at,
+                last_successful_scan_at,
+                last_failed_scan_at,
+                last_scan_error
             FROM repo_watchlists
             WHERE team_id = ?
         """
@@ -862,18 +1158,51 @@ class SQLiteStoreBackend(BaseStoreBackend):
     ) -> Dict[str, Any]:
         normalized_repo = normalize_repo_name(repo_name)
         resolved = self.resolve_ownership(ownership)
+        scan_interval_minutes = self.get_team_settings(ownership)["scan_interval_minutes"]
+        created_at = utc_now_iso()
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO repo_watchlists (team_id, repo_name, is_active, created_at, last_scanned_at)
-                VALUES (?, ?, 1, ?, NULL)
-                ON CONFLICT(team_id, repo_name) DO UPDATE SET is_active = 1
+                INSERT INTO repo_watchlists (
+                    team_id,
+                    repo_name,
+                    is_active,
+                    created_at,
+                    last_scanned_at,
+                    scan_interval_minutes,
+                    next_scan_at,
+                    last_successful_scan_at,
+                    last_failed_scan_at,
+                    last_scan_error
+                )
+                VALUES (?, ?, 1, ?, NULL, ?, ?, NULL, NULL, '')
+                ON CONFLICT(team_id, repo_name) DO UPDATE SET
+                    is_active = 1,
+                    scan_interval_minutes = excluded.scan_interval_minutes,
+                    next_scan_at = COALESCE(repo_watchlists.next_scan_at, excluded.next_scan_at)
                 """,
-                (resolved.team_id, normalized_repo, utc_now_iso()),
+                (
+                    resolved.team_id,
+                    normalized_repo,
+                    created_at,
+                    scan_interval_minutes,
+                    created_at,
+                ),
             )
             row = connection.execute(
                 """
-                SELECT id, team_id, repo_name, is_active, created_at, last_scanned_at
+                SELECT
+                    id,
+                    team_id,
+                    repo_name,
+                    is_active,
+                    created_at,
+                    last_scanned_at,
+                    scan_interval_minutes,
+                    next_scan_at,
+                    last_successful_scan_at,
+                    last_failed_scan_at,
+                    last_scan_error
                 FROM repo_watchlists
                 WHERE team_id = ? AND repo_name = ?
                 """,
@@ -899,6 +1228,524 @@ class SQLiteStoreBackend(BaseStoreBackend):
                 (watchlist_id, resolved.team_id),
             )
         return cursor.rowcount > 0
+
+    def get_team_settings(self, ownership: OwnershipContext) -> Dict[str, Any]:
+        resolved = self.resolve_ownership(ownership)
+        self._ensure_team_settings_row(resolved)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    team_id,
+                    alert_webhook_url,
+                    alert_min_risk,
+                    alert_min_confidence,
+                    scans_enabled,
+                    scan_limit,
+                    scan_interval_minutes,
+                    updated_at
+                FROM team_settings
+                WHERE team_id = ?
+                """,
+                (resolved.team_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"Team settings missing for team {resolved.team_slug}")
+        payload = dict(row)
+        payload["scans_enabled"] = bool(payload["scans_enabled"])
+        return payload
+
+    def update_team_settings(
+        self,
+        ownership: OwnershipContext,
+        *,
+        alert_webhook_url: Optional[str] = None,
+        alert_min_risk: Optional[str] = None,
+        alert_min_confidence: Optional[int] = None,
+        scans_enabled: Optional[bool] = None,
+        scan_limit: Optional[int] = None,
+        scan_interval_minutes: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        resolved = self.resolve_ownership(ownership)
+        self._ensure_team_settings_row(resolved)
+        current = self.get_team_settings(ownership)
+        next_values = {
+            "alert_webhook_url": (
+                None
+                if alert_webhook_url is not None and not alert_webhook_url.strip()
+                else current["alert_webhook_url"]
+                if alert_webhook_url is None
+                else alert_webhook_url.strip()
+            ),
+            "alert_min_risk": normalize_risk_level(alert_min_risk or current["alert_min_risk"]),
+            "alert_min_confidence": normalize_confidence_threshold(
+                current["alert_min_confidence"] if alert_min_confidence is None else alert_min_confidence
+            ),
+            "scans_enabled": current["scans_enabled"] if scans_enabled is None else bool(scans_enabled),
+            "scan_limit": normalize_scan_limit(current["scan_limit"] if scan_limit is None else scan_limit),
+            "scan_interval_minutes": normalize_scan_interval_minutes(
+                current["scan_interval_minutes"] if scan_interval_minutes is None else scan_interval_minutes
+            ),
+            "updated_at": utc_now_iso(),
+        }
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE team_settings
+                SET alert_webhook_url = ?,
+                    alert_min_risk = ?,
+                    alert_min_confidence = ?,
+                    scans_enabled = ?,
+                    scan_limit = ?,
+                    scan_interval_minutes = ?,
+                    updated_at = ?
+                WHERE team_id = ?
+                """,
+                (
+                    next_values["alert_webhook_url"],
+                    next_values["alert_min_risk"],
+                    next_values["alert_min_confidence"],
+                    1 if next_values["scans_enabled"] else 0,
+                    next_values["scan_limit"],
+                    next_values["scan_interval_minutes"],
+                    next_values["updated_at"],
+                    resolved.team_id,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE repo_watchlists
+                SET scan_interval_minutes = ?
+                WHERE team_id = ?
+                """,
+                (next_values["scan_interval_minutes"], resolved.team_id),
+            )
+        return self.get_team_settings(ownership)
+
+    def create_scan_run(
+        self,
+        ownership: OwnershipContext,
+        repo_watchlist_id: int,
+        repo_name: str,
+        trigger_mode: str,
+    ) -> int:
+        resolved = self.resolve_ownership(ownership)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO scan_runs (
+                    team_id,
+                    repo_watchlist_id,
+                    repo_name,
+                    trigger_mode,
+                    status,
+                    started_at,
+                    lock_expires_at,
+                    completed_at,
+                    error_message,
+                    findings_created,
+                    high_risk_findings,
+                    scanner_user_id
+                )
+                VALUES (?, ?, ?, ?, 'running', ?, ?, NULL, NULL, 0, 0, ?)
+                """,
+                (
+                    resolved.team_id,
+                    repo_watchlist_id,
+                    repo_name,
+                    trigger_mode,
+                    utc_now_iso(),
+                    utc_future_iso(DEFAULT_SCAN_LOCK_MINUTES),
+                    resolved.user_id,
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def claim_scan_run(
+        self,
+        ownership: OwnershipContext,
+        repo_watchlist_id: int,
+        repo_name: str,
+        trigger_mode: str,
+        lock_timeout_minutes: int = DEFAULT_SCAN_LOCK_MINUTES,
+    ) -> Optional[Dict[str, Any]]:
+        resolved = self.resolve_ownership(ownership)
+        now = utc_now_iso()
+        lock_expires_at = utc_future_iso(lock_timeout_minutes)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE scan_runs
+                SET status = 'failed',
+                    completed_at = ?,
+                    error_message = COALESCE(error_message, 'Scan lock expired before completion.'),
+                    lock_expires_at = NULL
+                WHERE team_id = ?
+                  AND repo_watchlist_id = ?
+                  AND status = 'running'
+                  AND lock_expires_at IS NOT NULL
+                  AND lock_expires_at <= ?
+                """,
+                (now, resolved.team_id, repo_watchlist_id, now),
+            )
+            try:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO scan_runs (
+                        team_id,
+                        repo_watchlist_id,
+                        repo_name,
+                        trigger_mode,
+                        status,
+                        started_at,
+                        lock_expires_at,
+                        completed_at,
+                        error_message,
+                        findings_created,
+                        high_risk_findings,
+                        scanner_user_id
+                    )
+                    VALUES (?, ?, ?, ?, 'running', ?, ?, NULL, NULL, 0, 0, ?)
+                    """,
+                    (
+                        resolved.team_id,
+                        repo_watchlist_id,
+                        repo_name,
+                        trigger_mode,
+                        now,
+                        lock_expires_at,
+                        resolved.user_id,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                return None
+        return {
+            "id": int(cursor.lastrowid),
+            "repo_watchlist_id": repo_watchlist_id,
+            "repo_name": repo_name,
+            "trigger_mode": trigger_mode,
+            "status": "running",
+            "started_at": now,
+            "lock_expires_at": lock_expires_at,
+        }
+
+    def complete_scan_run(
+        self,
+        ownership: OwnershipContext,
+        scan_run_id: int,
+        *,
+        status: str,
+        findings_created: int = 0,
+        high_risk_findings: int = 0,
+        error_message: Optional[str] = None,
+    ) -> bool:
+        normalized_status = normalize_scan_status(status)
+        resolved = self.resolve_ownership(ownership)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT repo_watchlist_id
+                FROM scan_runs
+                WHERE id = ? AND team_id = ?
+                """,
+                (scan_run_id, resolved.team_id),
+            ).fetchone()
+            if row is None:
+                return False
+            connection.execute(
+                """
+                UPDATE scan_runs
+                SET status = ?,
+                    completed_at = ?,
+                    error_message = ?,
+                    lock_expires_at = NULL,
+                    findings_created = ?,
+                    high_risk_findings = ?
+                WHERE id = ? AND team_id = ?
+                """,
+                (
+                    normalized_status,
+                    utc_now_iso(),
+                    (error_message or "").strip() or None,
+                    max(0, int(findings_created)),
+                    max(0, int(high_risk_findings)),
+                    scan_run_id,
+                    resolved.team_id,
+                ),
+            )
+            watchlist = connection.execute(
+                """
+                SELECT scan_interval_minutes
+                FROM repo_watchlists
+                WHERE id = ? AND team_id = ?
+                """,
+                (row["repo_watchlist_id"], resolved.team_id),
+            ).fetchone()
+            if watchlist is not None:
+                completed_at = utc_now_iso()
+                next_scan_at = utc_future_iso(
+                    watchlist["scan_interval_minutes"] or DEFAULT_SCAN_INTERVAL_MINUTES
+                )
+                if normalized_status == "completed":
+                    connection.execute(
+                        """
+                        UPDATE repo_watchlists
+                        SET last_scanned_at = ?,
+                            next_scan_at = ?,
+                            last_successful_scan_at = ?,
+                            last_scan_error = ''
+                        WHERE id = ? AND team_id = ?
+                        """,
+                        (
+                            completed_at,
+                            next_scan_at,
+                            completed_at,
+                            row["repo_watchlist_id"],
+                            resolved.team_id,
+                        ),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        UPDATE repo_watchlists
+                        SET last_scanned_at = ?,
+                            next_scan_at = ?,
+                            last_failed_scan_at = ?,
+                            last_scan_error = ?
+                        WHERE id = ? AND team_id = ?
+                        """,
+                        (
+                            completed_at,
+                            next_scan_at,
+                            completed_at,
+                            (error_message or "").strip() or "Scan failed.",
+                            row["repo_watchlist_id"],
+                            resolved.team_id,
+                        ),
+                    )
+        return True
+
+    def list_scan_runs(
+        self,
+        ownership: OwnershipContext,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        resolved = self.resolve_ownership(ownership)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    id,
+                    repo_watchlist_id,
+                    repo_name,
+                    trigger_mode,
+                    status,
+                    started_at,
+                    lock_expires_at,
+                    completed_at,
+                    error_message,
+                    findings_created,
+                    high_risk_findings
+                FROM scan_runs
+                WHERE team_id = ?
+                ORDER BY started_at DESC, id DESC
+                LIMIT ?
+                """,
+                (resolved.team_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_repo_watchlist(
+        self,
+        ownership: OwnershipContext,
+        watchlist_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        resolved = self.resolve_ownership(ownership)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    id,
+                    team_id,
+                    repo_name,
+                    is_active,
+                    created_at,
+                    last_scanned_at,
+                    scan_interval_minutes,
+                    next_scan_at,
+                    last_successful_scan_at,
+                    last_failed_scan_at,
+                    last_scan_error
+                FROM repo_watchlists
+                WHERE id = ? AND team_id = ?
+                """,
+                (watchlist_id, resolved.team_id),
+            ).fetchone()
+        if row is None:
+            return None
+        payload = dict(row)
+        payload["is_active"] = bool(payload["is_active"])
+        return payload
+
+    def list_scan_targets(
+        self,
+        *,
+        team_slug: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        query = """
+            SELECT
+                repo_watchlists.id AS repo_watchlist_id,
+                repo_watchlists.repo_name,
+                repo_watchlists.last_scanned_at,
+                repo_watchlists.scan_interval_minutes,
+                repo_watchlists.next_scan_at,
+                repo_watchlists.last_successful_scan_at,
+                repo_watchlists.last_failed_scan_at,
+                repo_watchlists.last_scan_error,
+                teams.slug AS team_slug,
+                teams.name AS team_name,
+                team_settings.alert_webhook_url,
+                team_settings.alert_min_risk,
+                team_settings.alert_min_confidence,
+                team_settings.scans_enabled,
+                team_settings.scan_limit,
+                team_settings.scan_interval_minutes AS team_scan_interval_minutes
+            FROM repo_watchlists
+            JOIN teams ON repo_watchlists.team_id = teams.id
+            LEFT JOIN team_settings ON repo_watchlists.team_id = team_settings.team_id
+            WHERE repo_watchlists.is_active = 1
+        """
+        params: List[Any] = []
+        if team_slug:
+            query += " AND teams.slug = ?"
+            params.append(team_slug)
+        query += " ORDER BY teams.slug ASC, repo_watchlists.repo_name ASC"
+        with self._connect() as connection:
+            rows = [dict(row) for row in connection.execute(query, params).fetchall()]
+        for row in rows:
+            row["scans_enabled"] = bool(row["scans_enabled"]) if row["scans_enabled"] is not None else True
+            row["alert_min_risk"] = normalize_risk_level(
+                row["alert_min_risk"] or DEFAULT_ALERT_MIN_RISK
+            )
+            row["alert_min_confidence"] = normalize_confidence_threshold(
+                row["alert_min_confidence"] if row["alert_min_confidence"] is not None else DEFAULT_ALERT_MIN_CONFIDENCE
+            )
+            row["scan_limit"] = normalize_scan_limit(
+                row["scan_limit"] if row["scan_limit"] is not None else DEFAULT_SCAN_LIMIT
+            )
+            row["scan_interval_minutes"] = normalize_scan_interval_minutes(
+                row["scan_interval_minutes"]
+                if row["scan_interval_minutes"] is not None
+                else row.get("team_scan_interval_minutes") or DEFAULT_SCAN_INTERVAL_MINUTES
+            )
+        return rows
+
+    def record_alert_delivery(
+        self,
+        ownership: OwnershipContext,
+        repo_name: str,
+        commit_sha: str,
+        file_name: str,
+        channel: str,
+        destination: str,
+        status: str,
+        error_message: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        resolved = self.resolve_ownership(ownership)
+        normalized_status = normalize_delivery_status(status)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COALESCE(MAX(attempt_number), 0) AS last_attempt
+                FROM alert_deliveries
+                WHERE team_id = ?
+                  AND repo_name = ?
+                  AND commit_sha = ?
+                  AND file_name = ?
+                  AND channel = ?
+                  AND destination = ?
+                """,
+                (
+                    resolved.team_id,
+                    repo_name,
+                    commit_sha,
+                    file_name,
+                    channel,
+                    destination,
+                ),
+            ).fetchone()
+            attempt_number = int(row["last_attempt"]) + 1
+            created_at = utc_now_iso()
+            cursor = connection.execute(
+                """
+                INSERT INTO alert_deliveries (
+                    team_id,
+                    repo_name,
+                    commit_sha,
+                    file_name,
+                    channel,
+                    destination,
+                    status,
+                    attempt_number,
+                    error_message,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    resolved.team_id,
+                    repo_name,
+                    commit_sha,
+                    file_name,
+                    channel,
+                    destination,
+                    normalized_status,
+                    attempt_number,
+                    (error_message or "").strip() or None,
+                    created_at,
+                ),
+            )
+        return {
+            "id": int(cursor.lastrowid),
+            "repo_name": repo_name,
+            "commit_sha": commit_sha,
+            "file_name": file_name,
+            "channel": channel,
+            "destination": destination,
+            "status": normalized_status,
+            "attempt_number": attempt_number,
+            "error_message": (error_message or "").strip() or None,
+            "created_at": created_at,
+        }
+
+    def list_alert_deliveries(
+        self,
+        ownership: OwnershipContext,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        resolved = self.resolve_ownership(ownership)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    id,
+                    repo_name,
+                    commit_sha,
+                    file_name,
+                    channel,
+                    destination,
+                    status,
+                    attempt_number,
+                    error_message,
+                    created_at
+                FROM alert_deliveries
+                WHERE team_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (resolved.team_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     @staticmethod
     def _json(value: Any) -> str:
@@ -1007,12 +1854,98 @@ class PostgresStoreBackend(BaseStoreBackend):
                         is_active BOOLEAN NOT NULL DEFAULT TRUE,
                         created_at TEXT NOT NULL,
                         last_scanned_at TEXT,
+                        scan_interval_minutes INTEGER NOT NULL DEFAULT 60,
+                        next_scan_at TEXT,
+                        last_successful_scan_at TEXT,
+                        last_failed_scan_at TEXT,
+                        last_scan_error TEXT NOT NULL DEFAULT '',
                         UNIQUE(team_id, repo_name)
                     );
+
+                    CREATE TABLE IF NOT EXISTS team_settings (
+                        team_id BIGINT PRIMARY KEY REFERENCES teams(id),
+                        alert_webhook_url TEXT,
+                        alert_min_risk TEXT NOT NULL DEFAULT 'high',
+                        alert_min_confidence INTEGER NOT NULL DEFAULT 80,
+                        scans_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                        scan_limit INTEGER NOT NULL DEFAULT 3,
+                        scan_interval_minutes INTEGER NOT NULL DEFAULT 60,
+                        updated_at TEXT NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS scan_runs (
+                        id BIGSERIAL PRIMARY KEY,
+                        team_id BIGINT NOT NULL REFERENCES teams(id),
+                        repo_watchlist_id BIGINT NOT NULL REFERENCES repo_watchlists(id),
+                        repo_name TEXT NOT NULL,
+                        trigger_mode TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        started_at TEXT NOT NULL,
+                        lock_expires_at TEXT,
+                        completed_at TEXT,
+                        error_message TEXT,
+                        findings_created INTEGER NOT NULL DEFAULT 0,
+                        high_risk_findings INTEGER NOT NULL DEFAULT 0,
+                        scanner_user_id BIGINT REFERENCES users(id)
+                    );
+
+                    CREATE TABLE IF NOT EXISTS alert_deliveries (
+                        id BIGSERIAL PRIMARY KEY,
+                        team_id BIGINT NOT NULL REFERENCES teams(id),
+                        repo_name TEXT NOT NULL,
+                        commit_sha TEXT NOT NULL,
+                        file_name TEXT NOT NULL,
+                        channel TEXT NOT NULL,
+                        destination TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        attempt_number INTEGER NOT NULL DEFAULT 1,
+                        error_message TEXT,
+                        created_at TEXT NOT NULL
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_scan_runs_team_started
+                        ON scan_runs(team_id, started_at DESC);
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_runs_running_lock
+                        ON scan_runs(team_id, repo_watchlist_id)
+                        WHERE status = 'running';
+                    CREATE INDEX IF NOT EXISTS idx_alert_deliveries_team_created
+                        ON alert_deliveries(team_id, created_at DESC);
                     """
                 )
                 cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_salt TEXT")
                 cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT")
+                cursor.execute(
+                    "ALTER TABLE repo_watchlists ADD COLUMN IF NOT EXISTS scan_interval_minutes INTEGER NOT NULL DEFAULT 60"
+                )
+                cursor.execute("ALTER TABLE repo_watchlists ADD COLUMN IF NOT EXISTS next_scan_at TEXT")
+                cursor.execute(
+                    "ALTER TABLE repo_watchlists ADD COLUMN IF NOT EXISTS last_successful_scan_at TEXT"
+                )
+                cursor.execute("ALTER TABLE repo_watchlists ADD COLUMN IF NOT EXISTS last_failed_scan_at TEXT")
+                cursor.execute(
+                    "ALTER TABLE repo_watchlists ADD COLUMN IF NOT EXISTS last_scan_error TEXT NOT NULL DEFAULT ''"
+                )
+                cursor.execute(
+                    "ALTER TABLE team_settings ADD COLUMN IF NOT EXISTS scan_interval_minutes INTEGER NOT NULL DEFAULT 60"
+                )
+                cursor.execute("ALTER TABLE scan_runs ADD COLUMN IF NOT EXISTS lock_expires_at TEXT")
+                cursor.execute(
+                    """
+                    UPDATE repo_watchlists
+                    SET scan_interval_minutes = COALESCE(scan_interval_minutes, %s),
+                        next_scan_at = COALESCE(next_scan_at, created_at, %s),
+                        last_scan_error = COALESCE(last_scan_error, '')
+                    """
+                    ,
+                    (DEFAULT_SCAN_INTERVAL_MINUTES, utc_now_iso()),
+                )
+                cursor.execute(
+                    """
+                    UPDATE team_settings
+                    SET scan_interval_minutes = COALESCE(scan_interval_minutes, %s)
+                    """,
+                    (DEFAULT_SCAN_INTERVAL_MINUTES,),
+                )
             connection.commit()
 
     def resolve_ownership(self, context: OwnershipContext) -> OwnershipRecord:
@@ -1058,6 +1991,37 @@ class PostgresStoreBackend(BaseStoreBackend):
             user_email=str(user["email"]),
             user_name=str(user["display_name"]),
         )
+
+    def _ensure_team_settings_row(self, resolved: OwnershipRecord) -> None:
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO team_settings (
+                        team_id,
+                        alert_webhook_url,
+                        alert_min_risk,
+                        alert_min_confidence,
+                        scans_enabled,
+                        scan_limit,
+                        scan_interval_minutes,
+                        updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (team_id) DO NOTHING
+                    """,
+                    (
+                        resolved.team_id,
+                        None,
+                        DEFAULT_ALERT_MIN_RISK,
+                        DEFAULT_ALERT_MIN_CONFIDENCE,
+                        True,
+                        DEFAULT_SCAN_LIMIT,
+                        DEFAULT_SCAN_INTERVAL_MINUTES,
+                        utc_now_iso(),
+                    ),
+                )
+            connection.commit()
 
     def get_membership(self, team_slug: str, user_email: str) -> Optional[OwnershipRecord]:
         query = """
@@ -1489,7 +2453,18 @@ class PostgresStoreBackend(BaseStoreBackend):
     ) -> List[Dict[str, Any]]:
         resolved = self.resolve_ownership(ownership)
         query = """
-            SELECT id, team_id, repo_name, is_active, created_at, last_scanned_at
+            SELECT
+                id,
+                team_id,
+                repo_name,
+                is_active,
+                created_at,
+                last_scanned_at,
+                scan_interval_minutes,
+                next_scan_at,
+                last_successful_scan_at,
+                last_failed_scan_at,
+                last_scan_error
             FROM repo_watchlists
             WHERE team_id = %s
         """
@@ -1509,16 +2484,49 @@ class PostgresStoreBackend(BaseStoreBackend):
     ) -> Dict[str, Any]:
         normalized_repo = normalize_repo_name(repo_name)
         resolved = self.resolve_ownership(ownership)
+        scan_interval_minutes = self.get_team_settings(ownership)["scan_interval_minutes"]
+        created_at = utc_now_iso()
         with self._connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    INSERT INTO repo_watchlists (team_id, repo_name, is_active, created_at, last_scanned_at)
-                    VALUES (%s, %s, TRUE, %s, NULL)
-                    ON CONFLICT(team_id, repo_name) DO UPDATE SET is_active = TRUE
-                    RETURNING id, team_id, repo_name, is_active, created_at, last_scanned_at
+                    INSERT INTO repo_watchlists (
+                        team_id,
+                        repo_name,
+                        is_active,
+                        created_at,
+                        last_scanned_at,
+                        scan_interval_minutes,
+                        next_scan_at,
+                        last_successful_scan_at,
+                        last_failed_scan_at,
+                        last_scan_error
+                    )
+                    VALUES (%s, %s, TRUE, %s, NULL, %s, %s, NULL, NULL, '')
+                    ON CONFLICT(team_id, repo_name) DO UPDATE SET
+                        is_active = TRUE,
+                        scan_interval_minutes = EXCLUDED.scan_interval_minutes,
+                        next_scan_at = COALESCE(repo_watchlists.next_scan_at, EXCLUDED.next_scan_at)
+                    RETURNING
+                        id,
+                        team_id,
+                        repo_name,
+                        is_active,
+                        created_at,
+                        last_scanned_at,
+                        scan_interval_minutes,
+                        next_scan_at,
+                        last_successful_scan_at,
+                        last_failed_scan_at,
+                        last_scan_error
                     """,
-                    (resolved.team_id, normalized_repo, utc_now_iso()),
+                    (
+                        resolved.team_id,
+                        normalized_repo,
+                        created_at,
+                        scan_interval_minutes,
+                        created_at,
+                    ),
                 )
                 row = cursor.fetchone()
             connection.commit()
@@ -1543,6 +2551,555 @@ class PostgresStoreBackend(BaseStoreBackend):
                 updated = cursor.rowcount > 0
             connection.commit()
         return updated
+
+    def get_team_settings(self, ownership: OwnershipContext) -> Dict[str, Any]:
+        resolved = self.resolve_ownership(ownership)
+        self._ensure_team_settings_row(resolved)
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        team_id,
+                        alert_webhook_url,
+                        alert_min_risk,
+                        alert_min_confidence,
+                        scans_enabled,
+                        scan_limit,
+                        scan_interval_minutes,
+                        updated_at
+                    FROM team_settings
+                    WHERE team_id = %s
+                    """,
+                    (resolved.team_id,),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            raise ValueError(f"Team settings missing for team {resolved.team_slug}")
+        payload = dict(row)
+        payload["scans_enabled"] = bool(payload["scans_enabled"])
+        return payload
+
+    def update_team_settings(
+        self,
+        ownership: OwnershipContext,
+        *,
+        alert_webhook_url: Optional[str] = None,
+        alert_min_risk: Optional[str] = None,
+        alert_min_confidence: Optional[int] = None,
+        scans_enabled: Optional[bool] = None,
+        scan_limit: Optional[int] = None,
+        scan_interval_minutes: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        resolved = self.resolve_ownership(ownership)
+        self._ensure_team_settings_row(resolved)
+        current = self.get_team_settings(ownership)
+        next_values = {
+            "alert_webhook_url": (
+                None
+                if alert_webhook_url is not None and not alert_webhook_url.strip()
+                else current["alert_webhook_url"]
+                if alert_webhook_url is None
+                else alert_webhook_url.strip()
+            ),
+            "alert_min_risk": normalize_risk_level(alert_min_risk or current["alert_min_risk"]),
+            "alert_min_confidence": normalize_confidence_threshold(
+                current["alert_min_confidence"] if alert_min_confidence is None else alert_min_confidence
+            ),
+            "scans_enabled": current["scans_enabled"] if scans_enabled is None else bool(scans_enabled),
+            "scan_limit": normalize_scan_limit(current["scan_limit"] if scan_limit is None else scan_limit),
+            "scan_interval_minutes": normalize_scan_interval_minutes(
+                current["scan_interval_minutes"] if scan_interval_minutes is None else scan_interval_minutes
+            ),
+            "updated_at": utc_now_iso(),
+        }
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE team_settings
+                    SET alert_webhook_url = %s,
+                        alert_min_risk = %s,
+                        alert_min_confidence = %s,
+                        scans_enabled = %s,
+                        scan_limit = %s,
+                        scan_interval_minutes = %s,
+                        updated_at = %s
+                    WHERE team_id = %s
+                    """,
+                    (
+                        next_values["alert_webhook_url"],
+                        next_values["alert_min_risk"],
+                        next_values["alert_min_confidence"],
+                        next_values["scans_enabled"],
+                        next_values["scan_limit"],
+                        next_values["scan_interval_minutes"],
+                        next_values["updated_at"],
+                        resolved.team_id,
+                    ),
+                )
+                cursor.execute(
+                    """
+                    UPDATE repo_watchlists
+                    SET scan_interval_minutes = %s
+                    WHERE team_id = %s
+                    """,
+                    (next_values["scan_interval_minutes"], resolved.team_id),
+                )
+            connection.commit()
+        return self.get_team_settings(ownership)
+
+    def create_scan_run(
+        self,
+        ownership: OwnershipContext,
+        repo_watchlist_id: int,
+        repo_name: str,
+        trigger_mode: str,
+    ) -> int:
+        resolved = self.resolve_ownership(ownership)
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO scan_runs (
+                        team_id,
+                        repo_watchlist_id,
+                        repo_name,
+                    trigger_mode,
+                    status,
+                    started_at,
+                    lock_expires_at,
+                    completed_at,
+                    error_message,
+                    findings_created,
+                        high_risk_findings,
+                        scanner_user_id
+                    )
+                    VALUES (%s, %s, %s, %s, 'running', %s, %s, NULL, NULL, 0, 0, %s)
+                    RETURNING id
+                    """,
+                    (
+                        resolved.team_id,
+                        repo_watchlist_id,
+                        repo_name,
+                        trigger_mode,
+                        utc_now_iso(),
+                        utc_future_iso(DEFAULT_SCAN_LOCK_MINUTES),
+                        resolved.user_id,
+                    ),
+                )
+                row = cursor.fetchone()
+            connection.commit()
+        return int(row["id"])
+
+    def claim_scan_run(
+        self,
+        ownership: OwnershipContext,
+        repo_watchlist_id: int,
+        repo_name: str,
+        trigger_mode: str,
+        lock_timeout_minutes: int = DEFAULT_SCAN_LOCK_MINUTES,
+    ) -> Optional[Dict[str, Any]]:
+        resolved = self.resolve_ownership(ownership)
+        now = utc_now_iso()
+        lock_expires_at = utc_future_iso(lock_timeout_minutes)
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE scan_runs
+                    SET status = 'failed',
+                        completed_at = %s,
+                        error_message = COALESCE(error_message, 'Scan lock expired before completion.'),
+                        lock_expires_at = NULL
+                    WHERE team_id = %s
+                      AND repo_watchlist_id = %s
+                      AND status = 'running'
+                      AND lock_expires_at IS NOT NULL
+                      AND lock_expires_at <= %s
+                    """,
+                    (now, resolved.team_id, repo_watchlist_id, now),
+                )
+                try:
+                    cursor.execute(
+                        """
+                        INSERT INTO scan_runs (
+                            team_id,
+                            repo_watchlist_id,
+                            repo_name,
+                            trigger_mode,
+                            status,
+                            started_at,
+                            lock_expires_at,
+                            completed_at,
+                            error_message,
+                            findings_created,
+                            high_risk_findings,
+                            scanner_user_id
+                        )
+                        VALUES (%s, %s, %s, %s, 'running', %s, %s, NULL, NULL, 0, 0, %s)
+                        RETURNING id
+                        """,
+                        (
+                            resolved.team_id,
+                            repo_watchlist_id,
+                            repo_name,
+                            trigger_mode,
+                            now,
+                            lock_expires_at,
+                            resolved.user_id,
+                        ),
+                    )
+                except psycopg2.errors.UniqueViolation:
+                    connection.rollback()
+                    return None
+                row = cursor.fetchone()
+            connection.commit()
+        return {
+            "id": int(row["id"]),
+            "repo_watchlist_id": repo_watchlist_id,
+            "repo_name": repo_name,
+            "trigger_mode": trigger_mode,
+            "status": "running",
+            "started_at": now,
+            "lock_expires_at": lock_expires_at,
+        }
+
+    def complete_scan_run(
+        self,
+        ownership: OwnershipContext,
+        scan_run_id: int,
+        *,
+        status: str,
+        findings_created: int = 0,
+        high_risk_findings: int = 0,
+        error_message: Optional[str] = None,
+    ) -> bool:
+        normalized_status = normalize_scan_status(status)
+        resolved = self.resolve_ownership(ownership)
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT repo_watchlist_id
+                    FROM scan_runs
+                    WHERE id = %s AND team_id = %s
+                    """,
+                    (scan_run_id, resolved.team_id),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return False
+                cursor.execute(
+                    """
+                    UPDATE scan_runs
+                    SET status = %s,
+                        completed_at = %s,
+                        error_message = %s,
+                        lock_expires_at = NULL,
+                        findings_created = %s,
+                        high_risk_findings = %s
+                    WHERE id = %s AND team_id = %s
+                    """,
+                    (
+                        normalized_status,
+                        utc_now_iso(),
+                        (error_message or "").strip() or None,
+                        max(0, int(findings_created)),
+                        max(0, int(high_risk_findings)),
+                        scan_run_id,
+                        resolved.team_id,
+                    ),
+                )
+                cursor.execute(
+                    """
+                    SELECT scan_interval_minutes
+                    FROM repo_watchlists
+                    WHERE id = %s AND team_id = %s
+                    """,
+                    (row["repo_watchlist_id"], resolved.team_id),
+                )
+                watchlist = cursor.fetchone()
+                if watchlist is not None and normalized_status == "completed":
+                    completed_at = utc_now_iso()
+                    next_scan_at = utc_future_iso(
+                        watchlist["scan_interval_minutes"] or DEFAULT_SCAN_INTERVAL_MINUTES
+                    )
+                    cursor.execute(
+                        """
+                        UPDATE repo_watchlists
+                        SET last_scanned_at = %s,
+                            next_scan_at = %s,
+                            last_successful_scan_at = %s,
+                            last_scan_error = ''
+                        WHERE id = %s AND team_id = %s
+                        """,
+                        (
+                            completed_at,
+                            next_scan_at,
+                            completed_at,
+                            row["repo_watchlist_id"],
+                            resolved.team_id,
+                        ),
+                    )
+                elif watchlist is not None:
+                    completed_at = utc_now_iso()
+                    next_scan_at = utc_future_iso(
+                        watchlist["scan_interval_minutes"] or DEFAULT_SCAN_INTERVAL_MINUTES
+                    )
+                    cursor.execute(
+                        """
+                        UPDATE repo_watchlists
+                        SET last_scanned_at = %s,
+                            next_scan_at = %s,
+                            last_failed_scan_at = %s,
+                            last_scan_error = %s
+                        WHERE id = %s AND team_id = %s
+                        """,
+                        (
+                            completed_at,
+                            next_scan_at,
+                            completed_at,
+                            (error_message or "").strip() or "Scan failed.",
+                            row["repo_watchlist_id"],
+                            resolved.team_id,
+                        ),
+                    )
+            connection.commit()
+        return True
+
+    def list_scan_runs(
+        self,
+        ownership: OwnershipContext,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        resolved = self.resolve_ownership(ownership)
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        id,
+                        repo_watchlist_id,
+                        repo_name,
+                        trigger_mode,
+                        status,
+                        started_at,
+                        lock_expires_at,
+                        completed_at,
+                        error_message,
+                        findings_created,
+                        high_risk_findings
+                    FROM scan_runs
+                    WHERE team_id = %s
+                    ORDER BY started_at DESC, id DESC
+                    LIMIT %s
+                    """,
+                    (resolved.team_id, limit),
+                )
+                return [dict(row) for row in cursor.fetchall()]
+
+    def get_repo_watchlist(
+        self,
+        ownership: OwnershipContext,
+        watchlist_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        resolved = self.resolve_ownership(ownership)
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        id,
+                        team_id,
+                        repo_name,
+                        is_active,
+                        created_at,
+                        last_scanned_at,
+                        scan_interval_minutes,
+                        next_scan_at,
+                        last_successful_scan_at,
+                        last_failed_scan_at,
+                        last_scan_error
+                    FROM repo_watchlists
+                    WHERE id = %s AND team_id = %s
+                    """,
+                    (watchlist_id, resolved.team_id),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            return None
+        payload = dict(row)
+        payload["is_active"] = bool(payload["is_active"])
+        return payload
+
+    def list_scan_targets(
+        self,
+        *,
+        team_slug: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        query = """
+            SELECT
+                repo_watchlists.id AS repo_watchlist_id,
+                repo_watchlists.repo_name,
+                repo_watchlists.last_scanned_at,
+                repo_watchlists.scan_interval_minutes,
+                repo_watchlists.next_scan_at,
+                repo_watchlists.last_successful_scan_at,
+                repo_watchlists.last_failed_scan_at,
+                repo_watchlists.last_scan_error,
+                teams.slug AS team_slug,
+                teams.name AS team_name,
+                team_settings.alert_webhook_url,
+                team_settings.alert_min_risk,
+                team_settings.alert_min_confidence,
+                team_settings.scans_enabled,
+                team_settings.scan_limit,
+                team_settings.scan_interval_minutes AS team_scan_interval_minutes
+            FROM repo_watchlists
+            JOIN teams ON repo_watchlists.team_id = teams.id
+            LEFT JOIN team_settings ON repo_watchlists.team_id = team_settings.team_id
+            WHERE repo_watchlists.is_active = TRUE
+        """
+        params: List[Any] = []
+        if team_slug:
+            query += " AND teams.slug = %s"
+            params.append(team_slug)
+        query += " ORDER BY teams.slug ASC, repo_watchlists.repo_name ASC"
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(query, params)
+                rows = [dict(row) for row in cursor.fetchall()]
+        for row in rows:
+            row["scans_enabled"] = bool(row["scans_enabled"]) if row["scans_enabled"] is not None else True
+            row["alert_min_risk"] = normalize_risk_level(
+                row["alert_min_risk"] or DEFAULT_ALERT_MIN_RISK
+            )
+            row["alert_min_confidence"] = normalize_confidence_threshold(
+                row["alert_min_confidence"] if row["alert_min_confidence"] is not None else DEFAULT_ALERT_MIN_CONFIDENCE
+            )
+            row["scan_limit"] = normalize_scan_limit(
+                row["scan_limit"] if row["scan_limit"] is not None else DEFAULT_SCAN_LIMIT
+            )
+            row["scan_interval_minutes"] = normalize_scan_interval_minutes(
+                row["scan_interval_minutes"]
+                if row["scan_interval_minutes"] is not None
+                else row.get("team_scan_interval_minutes") or DEFAULT_SCAN_INTERVAL_MINUTES
+            )
+        return rows
+
+    def record_alert_delivery(
+        self,
+        ownership: OwnershipContext,
+        repo_name: str,
+        commit_sha: str,
+        file_name: str,
+        channel: str,
+        destination: str,
+        status: str,
+        error_message: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        resolved = self.resolve_ownership(ownership)
+        normalized_status = normalize_delivery_status(status)
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT COALESCE(MAX(attempt_number), 0) AS last_attempt
+                    FROM alert_deliveries
+                    WHERE team_id = %s
+                      AND repo_name = %s
+                      AND commit_sha = %s
+                      AND file_name = %s
+                      AND channel = %s
+                      AND destination = %s
+                    """,
+                    (
+                        resolved.team_id,
+                        repo_name,
+                        commit_sha,
+                        file_name,
+                        channel,
+                        destination,
+                    ),
+                )
+                row = cursor.fetchone()
+                attempt_number = int(row["last_attempt"]) + 1
+                created_at = utc_now_iso()
+                cursor.execute(
+                    """
+                    INSERT INTO alert_deliveries (
+                        team_id,
+                        repo_name,
+                        commit_sha,
+                        file_name,
+                        channel,
+                        destination,
+                        status,
+                        attempt_number,
+                        error_message,
+                        created_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        resolved.team_id,
+                        repo_name,
+                        commit_sha,
+                        file_name,
+                        channel,
+                        destination,
+                        normalized_status,
+                        attempt_number,
+                        (error_message or "").strip() or None,
+                        created_at,
+                    ),
+                )
+                inserted = cursor.fetchone()
+            connection.commit()
+        return {
+            "id": int(inserted["id"]),
+            "repo_name": repo_name,
+            "commit_sha": commit_sha,
+            "file_name": file_name,
+            "channel": channel,
+            "destination": destination,
+            "status": normalized_status,
+            "attempt_number": attempt_number,
+            "error_message": (error_message or "").strip() or None,
+            "created_at": created_at,
+        }
+
+    def list_alert_deliveries(
+        self,
+        ownership: OwnershipContext,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        resolved = self.resolve_ownership(ownership)
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        id,
+                        repo_name,
+                        commit_sha,
+                        file_name,
+                        channel,
+                        destination,
+                        status,
+                        attempt_number,
+                        error_message,
+                        created_at
+                    FROM alert_deliveries
+                    WHERE team_id = %s
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT %s
+                    """,
+                    (resolved.team_id, limit),
+                )
+                return [dict(row) for row in cursor.fetchall()]
 
 
 class FindingStore:
@@ -1598,6 +3155,50 @@ def normalize_repo_name(repo_name: str) -> str:
     if not owner or not repo:
         raise ValueError("Repository must be in owner/name format.")
     return f"{owner}/{repo}"
+
+
+def normalize_risk_level(risk: str) -> str:
+    normalized = (risk or "").strip().lower()
+    if normalized not in {"low", "medium", "high"}:
+        raise ValueError("alert_min_risk must be one of: low, medium, high")
+    return normalized
+
+
+def normalize_confidence_threshold(value: int) -> int:
+    confidence = int(value)
+    return max(0, min(100, confidence))
+
+
+def normalize_scan_limit(value: int) -> int:
+    limit = int(value)
+    if limit < 1:
+        raise ValueError("scan_limit must be at least 1")
+    return min(limit, 50)
+
+
+def normalize_scan_interval_minutes(value: int) -> int:
+    interval = int(value)
+    if interval < 1:
+        raise ValueError("scan_interval_minutes must be at least 1")
+    return min(interval, 7 * 24 * 60)
+
+
+def normalize_scan_status(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    if normalized not in {"running", "completed", "failed"}:
+        raise ValueError("Invalid scan run status")
+    return normalized
+
+
+def normalize_delivery_status(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    if normalized not in {"delivered", "failed"}:
+        raise ValueError("Invalid delivery status")
+    return normalized
+
+
+def utc_future_iso(minutes: int) -> str:
+    return (datetime.now(timezone.utc) + timedelta(minutes=int(minutes))).isoformat()
 
 
 def build_history_context(

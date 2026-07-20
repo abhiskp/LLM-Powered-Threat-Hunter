@@ -107,6 +107,103 @@ def test_watchlist_and_findings_are_scoped_by_authenticated_team(tmp_path: Path)
         updated = alpha.get(f"/api/findings/{finding_id}")
         assert updated.status_code == 200
         assert updated.json()["finding"]["triaged_by_user_email"] == "alpha@example.com"
+
+        deliveries = alpha.get("/api/alert-deliveries")
+        assert deliveries.status_code == 200
+        assert deliveries.json()["alert_deliveries"][0]["channel"] == "log"
+    finally:
+        watchman.DATABASE_PATH = original_db
+        watchman.ALERTS_LOG_PATH = original_alert_path
+        threat_app.DATABASE_PATH = original_app_db
+        threat_app.ALERTS_LOG_PATH = original_app_alert
+
+
+def test_settings_and_scan_run_endpoints(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "settings.db"
+    alert_path = tmp_path / "alerts.jsonl"
+
+    original_db = watchman.DATABASE_PATH
+    original_alert_path = watchman.ALERTS_LOG_PATH
+    original_app_db = threat_app.DATABASE_PATH
+    original_app_alert = threat_app.ALERTS_LOG_PATH
+    try:
+        watchman.DATABASE_PATH = db_path
+        watchman.ALERTS_LOG_PATH = alert_path
+        threat_app.DATABASE_PATH = db_path
+        threat_app.ALERTS_LOG_PATH = alert_path
+
+        client = TestClient(threat_app.app)
+        register_team(client, "delta", "Delta Team", "delta@example.com", "Dana")
+
+        settings_update = client.post(
+            "/api/settings",
+            data={
+                "alert_webhook_url": "https://hooks.example.test/delta",
+                "alert_min_risk": "medium",
+                "alert_min_confidence": "70",
+                "scans_enabled": "true",
+                "scan_limit": "6",
+                "scan_interval_minutes": "90",
+            },
+        )
+        assert settings_update.status_code == 200
+        settings_payload = settings_update.json()["settings"]
+        assert settings_payload["alert_min_risk"] == "medium"
+        assert settings_payload["alert_min_confidence"] == 70
+        assert settings_payload["scan_limit"] == 6
+        assert settings_payload["scan_interval_minutes"] == 90
+
+        class FakeScanService:
+            def __init__(self, store=None):
+                self.store = store
+
+            def scan_watchlist_entry(self, ownership, watchlist_id, trigger_mode):
+                self.store.create_scan_run(ownership, watchlist_id, "psf/requests", trigger_mode)
+                latest = self.store.list_scan_runs(ownership, limit=1)[0]["id"]
+                self.store.complete_scan_run(
+                    ownership,
+                    latest,
+                    status="completed",
+                    findings_created=2,
+                    high_risk_findings=1,
+                )
+                return {
+                    "scan_run_id": latest,
+                    "team_slug": ownership.team_slug,
+                    "repo_name": "psf/requests",
+                    "status": "completed",
+                    "findings_created": 2,
+                    "high_risk_findings": 1,
+                    "commits_scanned": 1,
+                }
+
+            def run_cycle(self, team_slug=None):
+                return [
+                    {
+                        "scan_run_id": 999,
+                        "team_slug": team_slug or "delta",
+                        "repo_name": "psf/requests",
+                        "status": "completed",
+                        "findings_created": 4,
+                        "high_risk_findings": 2,
+                        "commits_scanned": 3,
+                    }
+                ]
+
+        monkeypatch.setattr(threat_app, "get_scan_service", lambda store=None: FakeScanService(store=store))
+
+        watchlist = client.get("/api/watchlist").json()["watchlist"]
+        scan_now = client.post(f"/api/watchlist/{watchlist[0]['id']}/scan-now")
+        assert scan_now.status_code == 200
+        assert scan_now.json()["scan_run"]["status"] == "completed"
+
+        runs = client.get("/api/scan-runs")
+        assert runs.status_code == 200
+        assert runs.json()["scan_runs"][0]["findings_created"] == 2
+
+        cycle = client.post("/api/scans/run-cycle")
+        assert cycle.status_code == 200
+        assert cycle.json()["scan_runs"][0]["high_risk_findings"] == 2
     finally:
         watchman.DATABASE_PATH = original_db
         watchman.ALERTS_LOG_PATH = original_alert_path

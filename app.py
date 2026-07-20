@@ -13,6 +13,7 @@ from watchman import (
     ALERTS_LOG_PATH,
     DATABASE_PATH,
     DATABASE_URL,
+    BackgroundScanService,
     DEFAULT_MODEL,
     DEFAULT_TARGET_REPO,
     VALID_DISPOSITIONS,
@@ -29,6 +30,10 @@ app = FastAPI(title="Threat Hunter Analyst Inbox", version="0.2.0")
 
 def get_store() -> FindingStore:
     return FindingStore(db_path=DATABASE_PATH, database_url=DATABASE_URL)
+
+
+def get_scan_service(store: Optional[FindingStore] = None) -> BackgroundScanService:
+    return BackgroundScanService(store=store or get_store())
 
 
 def record_to_ownership(record: OwnershipRecord) -> OwnershipContext:
@@ -106,6 +111,49 @@ def row_to_detail(row: Any) -> Dict[str, Any]:
         "triaged_by_user_name": row.get("triaged_by_user_name"),
         "created_at": row["created_at"],
         "yara_rule": row["yara_rule"],
+    }
+
+
+def team_settings_to_payload(settings: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "alert_webhook_url": settings.get("alert_webhook_url") or "",
+        "alert_min_risk": settings.get("alert_min_risk", "high"),
+        "alert_min_confidence": int(settings.get("alert_min_confidence", 80)),
+        "scans_enabled": bool(settings.get("scans_enabled", True)),
+        "scan_limit": int(settings.get("scan_limit", 3)),
+        "scan_interval_minutes": int(settings.get("scan_interval_minutes", 60)),
+        "updated_at": settings.get("updated_at"),
+    }
+
+
+def scan_run_to_payload(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": row["id"],
+        "repo_watchlist_id": row["repo_watchlist_id"],
+        "repo_name": row["repo_name"],
+        "trigger_mode": row["trigger_mode"],
+        "status": row["status"],
+        "started_at": row["started_at"],
+        "lock_expires_at": row.get("lock_expires_at"),
+        "completed_at": row["completed_at"],
+        "error_message": row["error_message"],
+        "findings_created": row["findings_created"],
+        "high_risk_findings": row["high_risk_findings"],
+    }
+
+
+def alert_delivery_to_payload(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": row["id"],
+        "repo_name": row["repo_name"],
+        "commit_sha": row["commit_sha"],
+        "file_name": row["file_name"],
+        "channel": row["channel"],
+        "destination": row["destination"],
+        "status": row["status"],
+        "attempt_number": int(row["attempt_number"]),
+        "error_message": row["error_message"],
+        "created_at": row["created_at"],
     }
 
 
@@ -287,7 +335,10 @@ def render_dashboard_html(
     findings: List[Dict[str, Any]],
     selected_finding: Optional[Dict[str, Any]],
     alerts: List[Dict[str, Any]],
+    alert_deliveries: List[Dict[str, Any]],
     watchlist: List[Dict[str, Any]],
+    team_settings: Dict[str, Any],
+    scan_runs: List[Dict[str, Any]],
     filters: Dict[str, str],
     session: Dict[str, str],
     backend_name: str,
@@ -355,11 +406,31 @@ def render_dashboard_html(
           <td>{escape(item['repo_name'])}</td>
           <td>{'active' if item['is_active'] else 'inactive'}</td>
           <td>{escape(item['last_scanned_at'] or 'never')}</td>
+          <td>{escape(item.get('next_scan_at') or 'due now')}</td>
+          <td>{escape(item.get('last_scan_error') or 'healthy')}</td>
           <td>
-            <form method="post" action="/watchlist/{item['id']}/deactivate">
-              <button type="submit" class="small danger">Deactivate</button>
-            </form>
+            <div class="inline-form">
+              <form method="post" action="/watchlist/{item['id']}/scan-now">
+                <button type="submit" class="small">Scan Now</button>
+              </form>
+              <form method="post" action="/watchlist/{item['id']}/deactivate">
+                <button type="submit" class="small danger">Deactivate</button>
+              </form>
+            </div>
           </td>
+        </tr>
+        """
+
+    delivery_rows = ""
+    for delivery in alert_deliveries:
+        delivery_rows += f"""
+        <tr>
+          <td>{escape(delivery['created_at'])}</td>
+          <td>{escape(delivery['repo_name'])}</td>
+          <td>{escape(delivery['channel'])}</td>
+          <td>{escape(delivery['status'])}</td>
+          <td>{delivery['attempt_number']}</td>
+          <td>{escape(delivery['error_message'] or '')}</td>
         </tr>
         """
 
@@ -372,6 +443,20 @@ def render_dashboard_html(
           <td>{escape(alert.get('repo_name', ''))}</td>
           <td>{escape(alert.get('file_name', ''))}</td>
           <td>{escape(alert.get('summary', ''))}</td>
+        </tr>
+        """
+
+    scan_run_rows = ""
+    for run in scan_runs:
+        scan_run_rows += f"""
+        <tr>
+          <td>{escape(run['started_at'])}</td>
+          <td>{escape(run['repo_name'])}</td>
+          <td>{escape(run['status'])}</td>
+          <td>{escape(run['trigger_mode'])}</td>
+          <td>{escape(run.get('lock_expires_at') or '')}</td>
+          <td>{run['findings_created']}</td>
+          <td>{run['high_risk_findings']}</td>
         </tr>
         """
 
@@ -530,6 +615,9 @@ def render_dashboard_html(
             <form method="post" action="/demo/test-scan">
               <button type="submit">Run Synthetic Demo Scan</button>
             </form>
+            <form method="post" action="/scans/run-cycle">
+              <button type="submit">Run Team Scan Cycle</button>
+            </form>
             <form method="get" action="/" class="filters">
               <select name="risk">
                 <option value="">All risks</option>
@@ -572,6 +660,31 @@ def render_dashboard_html(
               </div>
             </section>
             <section class="panel">
+              <div class="panel-header"><strong>Team Settings</strong></div>
+              <div class="panel-body">
+                <form method="post" action="/settings" class="watchlist-form">
+                  <label>Alert Webhook URL<input type="url" name="alert_webhook_url" value="{escape(team_settings.get('alert_webhook_url', ''))}" placeholder="https://hooks.slack.com/services/..." /></label>
+                  <label>Minimum Alert Risk
+                    <select name="alert_min_risk">
+                      <option value="high" {'selected' if team_settings.get('alert_min_risk') == 'high' else ''}>high</option>
+                      <option value="medium" {'selected' if team_settings.get('alert_min_risk') == 'medium' else ''}>medium</option>
+                      <option value="low" {'selected' if team_settings.get('alert_min_risk') == 'low' else ''}>low</option>
+                    </select>
+                  </label>
+                  <label>Minimum Alert Confidence<input type="number" min="0" max="100" name="alert_min_confidence" value="{team_settings.get('alert_min_confidence', 80)}" /></label>
+                  <label>Scan Limit Per Repo<input type="number" min="1" max="50" name="scan_limit" value="{team_settings.get('scan_limit', 3)}" /></label>
+                  <label>Scan Interval Minutes<input type="number" min="1" max="10080" name="scan_interval_minutes" value="{team_settings.get('scan_interval_minutes', 60)}" /></label>
+                  <label>Scanning Enabled
+                    <select name="scans_enabled">
+                      <option value="true" {'selected' if team_settings.get('scans_enabled', True) else ''}>true</option>
+                      <option value="false" {'selected' if not team_settings.get('scans_enabled', True) else ''}>false</option>
+                    </select>
+                  </label>
+                  <button type="submit">Save Team Settings</button>
+                </form>
+              </div>
+            </section>
+            <section class="panel">
               <div class="panel-header"><strong>Repo Watchlist</strong></div>
               <div class="panel-body">
                 <form method="post" action="/watchlist" class="watchlist-form">
@@ -580,16 +693,48 @@ def render_dashboard_html(
                 </form>
                 <table class="watchlist-table" style="margin-top: 18px;">
                   <thead>
-                    <tr><th>Repo</th><th>Status</th><th>Last Scanned</th><th></th></tr>
+                    <tr><th>Repo</th><th>Status</th><th>Last Scanned</th><th>Next Scan</th><th>Last Error</th><th></th></tr>
                   </thead>
                   <tbody>
-                    {watchlist_rows or "<tr><td colspan='4' class='muted'>No watched repos yet.</td></tr>"}
+                    {watchlist_rows or "<tr><td colspan='6' class='muted'>No watched repos yet.</td></tr>"}
                   </tbody>
                 </table>
               </div>
             </section>
           </div>
         </div>
+
+        <section class="panel" style="margin-top: 24px;">
+          <div class="panel-header"><strong>Recent Scan Runs</strong></div>
+          <div class="panel-body">
+            <table class="inbox-table">
+              <thead>
+                <tr>
+                  <th>Started</th><th>Repo</th><th>Status</th><th>Trigger</th><th>Lock Until</th><th>Findings</th><th>High Risk</th>
+                </tr>
+              </thead>
+              <tbody>
+                {scan_run_rows or "<tr><td colspan='7' class='muted'>No scan runs yet.</td></tr>"}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel" style="margin-top: 24px;">
+          <div class="panel-header"><strong>Alert Delivery Attempts</strong></div>
+          <div class="panel-body">
+            <table class="inbox-table">
+              <thead>
+                <tr>
+                  <th>Created</th><th>Repo</th><th>Channel</th><th>Status</th><th>Attempt</th><th>Error</th>
+                </tr>
+              </thead>
+              <tbody>
+                {delivery_rows or "<tr><td colspan='6' class='muted'>No alert deliveries recorded yet.</td></tr>"}
+              </tbody>
+            </table>
+          </div>
+        </section>
 
         <section class="panel" style="margin-top: 24px;">
           <div class="panel-header"><strong>Alert Inbox</strong></div>
@@ -711,9 +856,41 @@ def session_api(request: Request) -> Dict[str, Any]:
             "user_email": record.user_email,
             "user_name": record.user_name,
         },
+        "settings": team_settings_to_payload(store.get_team_settings(ownership=ownership)),
         "watchlist": store.list_repo_watchlists(ownership=ownership),
         "store_backend": store.backend_name,
     }
+
+
+@app.get("/api/settings")
+def settings_api(request: Request) -> Dict[str, Any]:
+    store = get_store()
+    ownership = record_to_ownership(get_authenticated_record(request, store=store))
+    return {"settings": team_settings_to_payload(store.get_team_settings(ownership=ownership))}
+
+
+@app.post("/api/settings")
+def update_settings_api(
+    request: Request,
+    alert_webhook_url: str = Form(default=""),
+    alert_min_risk: str = Form(...),
+    alert_min_confidence: int = Form(...),
+    scans_enabled: str = Form(...),
+    scan_limit: int = Form(...),
+    scan_interval_minutes: int = Form(...),
+) -> Dict[str, Any]:
+    store = get_store()
+    ownership = record_to_ownership(get_authenticated_record(request, store=store))
+    settings = store.update_team_settings(
+        ownership=ownership,
+        alert_webhook_url=alert_webhook_url,
+        alert_min_risk=alert_min_risk,
+        alert_min_confidence=alert_min_confidence,
+        scans_enabled=scans_enabled.strip().lower() == "true",
+        scan_limit=scan_limit,
+        scan_interval_minutes=scan_interval_minutes,
+    )
+    return {"settings": team_settings_to_payload(settings)}
 
 
 @app.get("/api/findings")
@@ -775,6 +952,14 @@ def alerts_api(request: Request, limit: int = 20) -> Dict[str, Any]:
     return {"alerts": load_alert_inbox(team_slug=record.team_slug, limit=limit)}
 
 
+@app.get("/api/alert-deliveries")
+def alert_deliveries_api(request: Request, limit: int = 20) -> Dict[str, Any]:
+    store = get_store()
+    ownership = record_to_ownership(get_authenticated_record(request, store=store))
+    rows = store.list_alert_deliveries(ownership=ownership, limit=limit)
+    return {"alert_deliveries": [alert_delivery_to_payload(row) for row in rows]}
+
+
 @app.get("/api/watchlist")
 def list_watchlist_api(request: Request) -> Dict[str, Any]:
     store = get_store()
@@ -804,6 +989,38 @@ def deactivate_watchlist_api(watchlist_id: int, request: Request) -> Dict[str, A
     if not updated:
         raise HTTPException(status_code=404, detail="Watchlist entry not found")
     return {"updated": True}
+
+
+@app.get("/api/scan-runs")
+def scan_runs_api(request: Request, limit: int = 20) -> Dict[str, Any]:
+    store = get_store()
+    ownership = record_to_ownership(get_authenticated_record(request, store=store))
+    rows = store.list_scan_runs(ownership=ownership, limit=limit)
+    return {"scan_runs": [scan_run_to_payload(row) for row in rows]}
+
+
+@app.post("/api/watchlist/{watchlist_id}/scan-now")
+def scan_watchlist_now_api(watchlist_id: int, request: Request) -> Dict[str, Any]:
+    store = get_store()
+    ownership = record_to_ownership(get_authenticated_record(request, store=store))
+    result = get_scan_service(store=store).scan_watchlist_entry(
+        ownership=ownership,
+        watchlist_id=watchlist_id,
+        trigger_mode="manual",
+    )
+    if result.get("status") == "skipped":
+        raise HTTPException(status_code=409, detail="A scan is already running for this repository")
+    if result.get("status") == "failed":
+        raise HTTPException(status_code=502, detail=result.get("error_message", "Scan failed"))
+    return {"scan_run": result}
+
+
+@app.post("/api/scans/run-cycle")
+def run_scan_cycle_api(request: Request) -> Dict[str, Any]:
+    store = get_store()
+    record = get_authenticated_record(request, store=store)
+    results = get_scan_service(store=store).run_cycle(team_slug=record.team_slug)
+    return {"scan_runs": results}
 
 
 @app.post("/api/demo/test-scan")
@@ -847,6 +1064,7 @@ def demo_test_scan_api(request: Request) -> Dict[str, Any]:
         commit_sha=commit_sha,
         file_name="requests/api.py",
         result=result,
+        store=store,
     )
     if result.should_save_yara():
         hunter.save_yara_rule(result.yara_rule or "", commit_sha, "requests/api.py")
@@ -874,6 +1092,7 @@ def dashboard(
         return authenticated_redirect()
 
     ownership = record_to_ownership(record)
+    team_settings = store.get_team_settings(ownership=ownership)
     findings = [
         row_to_summary(row)
         for row in store.list_findings(
@@ -899,7 +1118,13 @@ def dashboard(
         findings=findings,
         selected_finding=selected_finding,
         alerts=load_alert_inbox(team_slug=record.team_slug, limit=20),
+        alert_deliveries=[
+            alert_delivery_to_payload(row)
+            for row in store.list_alert_deliveries(ownership=ownership, limit=10)
+        ],
         watchlist=store.list_repo_watchlists(ownership=ownership),
+        team_settings=team_settings_to_payload(team_settings),
+        scan_runs=[scan_run_to_payload(row) for row in store.list_scan_runs(ownership=ownership, limit=10)],
         filters={
             "limit": str(limit),
             "risk": risk or "",
@@ -957,6 +1182,54 @@ def deactivate_watchlist_form(watchlist_id: int, request: Request) -> RedirectRe
     updated = store.deactivate_repo_watchlist(ownership=ownership, watchlist_id=watchlist_id)
     if not updated:
         raise HTTPException(status_code=404, detail="Watchlist entry not found")
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/watchlist/{watchlist_id}/scan-now")
+def scan_watchlist_now_form(watchlist_id: int, request: Request) -> RedirectResponse:
+    store = get_store()
+    ownership = record_to_ownership(get_authenticated_record(request, store=store))
+    result = get_scan_service(store=store).scan_watchlist_entry(
+        ownership=ownership,
+        watchlist_id=watchlist_id,
+        trigger_mode="manual",
+    )
+    if result.get("status") == "skipped":
+        raise HTTPException(status_code=409, detail="A scan is already running for this repository")
+    if result.get("status") == "failed":
+        raise HTTPException(status_code=502, detail=result.get("error_message", "Scan failed"))
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/settings")
+def update_settings_form(
+    request: Request,
+    alert_webhook_url: str = Form(default=""),
+    alert_min_risk: str = Form(...),
+    alert_min_confidence: int = Form(...),
+    scans_enabled: str = Form(...),
+    scan_limit: int = Form(...),
+    scan_interval_minutes: int = Form(...),
+) -> RedirectResponse:
+    store = get_store()
+    ownership = record_to_ownership(get_authenticated_record(request, store=store))
+    store.update_team_settings(
+        ownership=ownership,
+        alert_webhook_url=alert_webhook_url,
+        alert_min_risk=alert_min_risk,
+        alert_min_confidence=alert_min_confidence,
+        scans_enabled=scans_enabled.strip().lower() == "true",
+        scan_limit=scan_limit,
+        scan_interval_minutes=scan_interval_minutes,
+    )
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/scans/run-cycle")
+def run_scan_cycle_form(request: Request) -> RedirectResponse:
+    store = get_store()
+    record = get_authenticated_record(request, store=store)
+    get_scan_service(store=store).run_cycle(team_slug=record.team_slug)
     return RedirectResponse(url="/", status_code=303)
 
 

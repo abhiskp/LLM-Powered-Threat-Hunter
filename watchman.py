@@ -29,14 +29,17 @@ WATCHLIST_PATH = Path(os.getenv("WATCHLIST_PATH", "watchlist.txt"))
 SUPPRESSIONS_PATH = Path(os.getenv("SUPPRESSIONS_PATH", "suppressions.json"))
 DEFAULT_EVAL_DATASET = Path(os.getenv("EVAL_DATASET_PATH", "datasets/eval_dataset.json"))
 DEFAULT_SCAN_LIMIT = int(os.getenv("WATCHMAN_SCAN_LIMIT", "3"))
+DEFAULT_SCAN_INTERVAL_MINUTES = int(os.getenv("WATCHMAN_SCAN_INTERVAL_MINUTES", "60"))
 ALERTS_LOG_PATH = Path(os.getenv("ALERTS_LOG_PATH", "alerts/alerts.jsonl"))
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")
 ALERT_MIN_RISK = os.getenv("ALERT_MIN_RISK", "high").strip().lower()
 ALERT_MIN_CONFIDENCE = int(os.getenv("ALERT_MIN_CONFIDENCE", "80"))
+SCAN_LOCK_TIMEOUT_MINUTES = int(os.getenv("WATCHMAN_SCAN_LOCK_MINUTES", "30"))
 DEFAULT_TEAM_SLUG = os.getenv("WATCHMAN_DEFAULT_TEAM_SLUG", "personal-lab")
 DEFAULT_TEAM_NAME = os.getenv("WATCHMAN_DEFAULT_TEAM_NAME", "Personal Lab")
 DEFAULT_USER_EMAIL = os.getenv("WATCHMAN_DEFAULT_USER_EMAIL", "analyst@example.com")
 DEFAULT_USER_NAME = os.getenv("WATCHMAN_DEFAULT_USER_NAME", "Local Analyst")
+BACKGROUND_SCANNER_USER_NAME = os.getenv("WATCHMAN_BACKGROUND_USER_NAME", "Background Scanner")
 VALID_DISPOSITIONS = {"new", "true_positive", "false_positive", "ignored"}
 
 RISK_ORDER = {"unknown": 0, "low": 1, "medium": 2, "high": 3}
@@ -93,6 +96,16 @@ class AlertDeliveryResult:
     channels: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
 
+
+@dataclass
+class ScanExecutionResult:
+    repo_name: str
+    commits_seen: int = 0
+    commits_scanned: int = 0
+    findings_created: int = 0
+    high_risk_findings: int = 0
+    skipped_commits: int = 0
+
 def default_ownership_context(
     team_slug: Optional[str] = None,
     team_name: Optional[str] = None,
@@ -127,12 +140,13 @@ class ThreatHunter:
         self.ownership = ownership or default_ownership_context()
         SIGNATURES_DIR.mkdir(parents=True, exist_ok=True)
 
-    def monitor_repository(self, repo_name: str, limit: int = 3, skip_existing: bool = True) -> None:
+    def monitor_repository(self, repo_name: str, limit: int = 3, skip_existing: bool = True) -> ScanExecutionResult:
         if not self.github:
             raise ValueError("Missing GITHUB_TOKEN. Required for repository scanning.")
 
         repo = self.github.get_repo(repo_name)
         commits = repo.get_commits()
+        summary = ScanExecutionResult(repo_name=repo_name)
 
         print(f"--- Monitoring {repo_name} ---")
 
@@ -140,11 +154,14 @@ class ThreatHunter:
             if index >= limit:
                 break
 
+            summary.commits_seen += 1
             commit_sha = commit.sha
             if skip_existing and self.store.commit_exists(self.ownership, repo_name, commit_sha):
                 print(f"\n[-] Skipping {commit_sha[:7]} (already analyzed)")
+                summary.skipped_commits += 1
                 continue
 
+            summary.commits_scanned += 1
             author_name = getattr(commit.commit.author, "name", "Unknown")
             commit_message = getattr(commit.commit, "message", "")
             print(f"\n[+] Analyzing Commit: {commit_sha[:7]}")
@@ -177,6 +194,9 @@ class ThreatHunter:
                     file_name=changed_file.filename,
                     result=result,
                 )
+                summary.findings_created += 1
+                if result.normalized_risk() == "high":
+                    summary.high_risk_findings += 1
                 self._print_result(result)
                 delivery = deliver_alert(
                     ownership=self.ownership,
@@ -184,6 +204,7 @@ class ThreatHunter:
                     commit_sha=commit_sha,
                     file_name=changed_file.filename,
                     result=result,
+                    store=self.store,
                 )
                 if delivery.delivered:
                     print(f"    Alert delivered: {', '.join(delivery.channels)}")
@@ -193,6 +214,7 @@ class ThreatHunter:
                 if result.should_save_yara():
                     yara_path = self.save_yara_rule(result.yara_rule or "", commit_sha, changed_file.filename)
                     print(f"    YARA saved: {yara_path}")
+        return summary
 
     def analyze_patch(
         self,
@@ -804,11 +826,60 @@ def print_evaluation_report(results: List[EvaluationCaseResult]) -> None:
         print("  Current dataset is passing cleanly. Add more diverse benign and malicious samples next.")
 
 
-def should_deliver_alert(result: DetectionResult) -> bool:
+def print_scan_run_report(results: List[Dict[str, Any]]) -> None:
+    if not results:
+        print("No scan targets were run.")
+        return
+    for result in results:
+        status = str(result.get("status", "unknown")).upper()
+        print(f"[{status}] {result.get('team_slug')} {result.get('repo_name')}")
+        if result.get("status") == "completed":
+            print(
+                "       findings_created="
+                f"{result.get('findings_created', 0)} high_risk_findings={result.get('high_risk_findings', 0)} "
+                f"commits_scanned={result.get('commits_scanned', 0)}"
+            )
+        elif result.get("error_message"):
+            print(f"       error={result['error_message']}")
+
+
+def resolve_alert_settings(
+    ownership: OwnershipContext,
+    store: Optional[FindingStore] = None,
+) -> Dict[str, Any]:
+    defaults = {
+        "alert_webhook_url": ALERT_WEBHOOK_URL,
+        "alert_min_risk": ALERT_MIN_RISK,
+        "alert_min_confidence": ALERT_MIN_CONFIDENCE,
+        "scans_enabled": True,
+        "scan_limit": DEFAULT_SCAN_LIMIT,
+    }
+    if store is None:
+        return defaults
+    try:
+        persisted = store.get_team_settings(ownership)
+    except Exception:
+        return defaults
+    return {
+        "alert_webhook_url": persisted.get("alert_webhook_url") or ALERT_WEBHOOK_URL,
+        "alert_min_risk": str(persisted.get("alert_min_risk") or ALERT_MIN_RISK).strip().lower(),
+        "alert_min_confidence": int(persisted.get("alert_min_confidence", ALERT_MIN_CONFIDENCE)),
+        "scans_enabled": bool(persisted.get("scans_enabled", True)),
+        "scan_limit": int(persisted.get("scan_limit", DEFAULT_SCAN_LIMIT)),
+        "scan_interval_minutes": int(
+            persisted.get("scan_interval_minutes", DEFAULT_SCAN_INTERVAL_MINUTES)
+        ),
+    }
+
+
+def should_deliver_alert(result: DetectionResult, settings: Optional[Dict[str, Any]] = None) -> bool:
+    settings = settings or {}
     normalized_risk = result.normalized_risk()
-    if RISK_ORDER.get(normalized_risk, 0) < RISK_ORDER.get(ALERT_MIN_RISK, RISK_ORDER["high"]):
+    min_risk = str(settings.get("alert_min_risk", ALERT_MIN_RISK)).strip().lower()
+    min_confidence = int(settings.get("alert_min_confidence", ALERT_MIN_CONFIDENCE))
+    if RISK_ORDER.get(normalized_risk, 0) < RISK_ORDER.get(min_risk, RISK_ORDER["high"]):
         return False
-    if result.confidence < ALERT_MIN_CONFIDENCE:
+    if result.confidence < min_confidence:
         return False
     if result.suppression_context.get("matched_rule_ids"):
         return False
@@ -846,8 +917,11 @@ def deliver_alert(
     commit_sha: str,
     file_name: str,
     result: DetectionResult,
+    store: Optional[FindingStore] = None,
+    settings: Optional[Dict[str, Any]] = None,
 ) -> AlertDeliveryResult:
-    if not should_deliver_alert(result):
+    effective_settings = settings or resolve_alert_settings(ownership, store=store)
+    if not should_deliver_alert(result, settings=effective_settings):
         return AlertDeliveryResult(delivered=False)
 
     payload = build_alert_payload(ownership, repo_name, commit_sha, file_name, result)
@@ -858,10 +932,21 @@ def deliver_alert(
     with ALERTS_LOG_PATH.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload) + "\n")
     channels.append(f"log:{ALERTS_LOG_PATH}")
+    if store is not None:
+        store.record_alert_delivery(
+            ownership=ownership,
+            repo_name=repo_name,
+            commit_sha=commit_sha,
+            file_name=file_name,
+            channel="log",
+            destination=str(ALERTS_LOG_PATH),
+            status="delivered",
+        )
 
-    if ALERT_WEBHOOK_URL:
+    webhook_url = effective_settings.get("alert_webhook_url") or ALERT_WEBHOOK_URL
+    if webhook_url:
         request = urllib.request.Request(
-            ALERT_WEBHOOK_URL,
+            str(webhook_url),
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -870,10 +955,163 @@ def deliver_alert(
             with urllib.request.urlopen(request, timeout=10) as response:
                 response.read()
             channels.append("webhook")
+            if store is not None:
+                store.record_alert_delivery(
+                    ownership=ownership,
+                    repo_name=repo_name,
+                    commit_sha=commit_sha,
+                    file_name=file_name,
+                    channel="webhook",
+                    destination=str(webhook_url),
+                    status="delivered",
+                )
         except (urllib.error.URLError, TimeoutError, ValueError) as exc:
             errors.append(f"webhook failed: {exc}")
+            if store is not None:
+                store.record_alert_delivery(
+                    ownership=ownership,
+                    repo_name=repo_name,
+                    commit_sha=commit_sha,
+                    file_name=file_name,
+                    channel="webhook",
+                    destination=str(webhook_url),
+                    status="failed",
+                    error_message=str(exc),
+                )
 
     return AlertDeliveryResult(delivered=bool(channels), channels=channels, errors=errors)
+
+
+class BackgroundScanService:
+    def __init__(
+        self,
+        store: Optional[FindingStore] = None,
+        github_token: Optional[str] = GITHUB_TOKEN,
+        openai_api_key: Optional[str] = OPENAI_API_KEY,
+        model: str = DEFAULT_MODEL,
+    ) -> None:
+        self.store = store or FindingStore(db_path=DATABASE_PATH, database_url=DATABASE_URL)
+        self.github_token = github_token
+        self.openai_api_key = openai_api_key
+        self.model = model
+
+    def list_targets(self, team_slug: Optional[str] = None) -> List[Dict[str, Any]]:
+        return self.store.list_scan_targets(team_slug=team_slug)
+
+    def run_cycle(self, team_slug: Optional[str] = None) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        for target in self.list_targets(team_slug=team_slug):
+            if not target.get("scans_enabled", True):
+                continue
+            if not self._is_target_due(target):
+                continue
+            results.append(self.scan_target(target, trigger_mode="scheduled"))
+        return results
+
+    @staticmethod
+    def _is_target_due(target: Dict[str, Any]) -> bool:
+        next_scan_at = str(target.get("next_scan_at") or "").strip()
+        if not next_scan_at:
+            return True
+        try:
+            return datetime.fromisoformat(next_scan_at) <= datetime.now(timezone.utc)
+        except ValueError:
+            return True
+
+    def scan_watchlist_entry(
+        self,
+        ownership: OwnershipContext,
+        watchlist_id: int,
+        trigger_mode: str = "manual",
+    ) -> Dict[str, Any]:
+        watchlist_row = self.store.get_repo_watchlist(ownership, watchlist_id)
+        if watchlist_row is None:
+            raise ValueError("Watchlist entry not found.")
+        team_settings = resolve_alert_settings(ownership, store=self.store)
+        target = {
+            "repo_watchlist_id": watchlist_row["id"],
+            "repo_name": watchlist_row["repo_name"],
+            "team_slug": ownership.team_slug,
+            "team_name": ownership.team_name,
+            "alert_webhook_url": team_settings["alert_webhook_url"],
+            "alert_min_risk": team_settings["alert_min_risk"],
+            "alert_min_confidence": team_settings["alert_min_confidence"],
+            "scans_enabled": team_settings["scans_enabled"],
+            "scan_limit": team_settings["scan_limit"],
+            "scan_interval_minutes": watchlist_row.get("scan_interval_minutes", team_settings["scan_interval_minutes"]),
+            "next_scan_at": watchlist_row.get("next_scan_at"),
+        }
+        return self.scan_target(target, trigger_mode=trigger_mode)
+
+    def scan_target(self, target: Dict[str, Any], trigger_mode: str) -> Dict[str, Any]:
+        ownership = default_ownership_context(
+            team_slug=target["team_slug"],
+            team_name=target["team_name"],
+            user_email=f"scanner+{target['team_slug']}@watchman.local",
+            user_name=BACKGROUND_SCANNER_USER_NAME,
+        )
+        scan_run = self.store.claim_scan_run(
+            ownership=ownership,
+            repo_watchlist_id=int(target["repo_watchlist_id"]),
+            repo_name=str(target["repo_name"]),
+            trigger_mode=trigger_mode,
+            lock_timeout_minutes=SCAN_LOCK_TIMEOUT_MINUTES,
+        )
+        if scan_run is None:
+            return {
+                "scan_run_id": None,
+                "team_slug": ownership.team_slug,
+                "repo_name": str(target["repo_name"]),
+                "status": "skipped",
+                "skip_reason": "already_running",
+            }
+        scan_run_id = int(scan_run["id"])
+        try:
+            hunter = ThreatHunter(
+                github_token=self.github_token,
+                openai_api_key=self.openai_api_key,
+                db_path=DATABASE_PATH,
+                database_url=DATABASE_URL,
+                model=self.model,
+                suppressions=load_suppressions(),
+                ownership=ownership,
+                store=self.store,
+            )
+            summary = hunter.monitor_repository(
+                repo_name=str(target["repo_name"]),
+                limit=int(target.get("scan_limit", DEFAULT_SCAN_LIMIT)),
+                skip_existing=True,
+            )
+            self.store.complete_scan_run(
+                ownership=ownership,
+                scan_run_id=scan_run_id,
+                status="completed",
+                findings_created=summary.findings_created,
+                high_risk_findings=summary.high_risk_findings,
+            )
+            return {
+                "scan_run_id": scan_run_id,
+                "team_slug": ownership.team_slug,
+                "repo_name": summary.repo_name,
+                "status": "completed",
+                "findings_created": summary.findings_created,
+                "high_risk_findings": summary.high_risk_findings,
+                "commits_scanned": summary.commits_scanned,
+            }
+        except Exception as exc:
+            self.store.complete_scan_run(
+                ownership=ownership,
+                scan_run_id=scan_run_id,
+                status="failed",
+                error_message=str(exc),
+            )
+            return {
+                "scan_run_id": scan_run_id,
+                "team_slug": ownership.team_slug,
+                "repo_name": str(target["repo_name"]),
+                "status": "failed",
+                "error_message": str(exc),
+            }
 
 
 def build_hunter() -> ThreatHunter:
@@ -991,6 +1229,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use the configured LLM during evaluation instead of rule-only scoring",
     )
 
+    worker_parser = subparsers.add_parser("run-worker", help="Run background scans for active team watchlists")
+    worker_parser.add_argument(
+        "--all-teams",
+        action="store_true",
+        help="Run the scan cycle for every team with active watchlists",
+    )
+
     return parser
 
 
@@ -1097,6 +1342,7 @@ def main() -> None:
             commit_sha=args.commit_sha,
             file_name=args.filename,
             result=result,
+            store=hunter.store,
         )
         if delivery.delivered:
             print(f"Alert delivered: {', '.join(delivery.channels)}")
@@ -1126,6 +1372,12 @@ def main() -> None:
         finally:
             if temp_db_path.exists():
                 temp_db_path.unlink()
+        return
+
+    if args.command == "run-worker":
+        service = BackgroundScanService()
+        results = service.run_cycle(team_slug=None if args.all_teams else ownership.team_slug)
+        print_scan_run_report(results)
         return
 
     parser.error(f"Unsupported command: {args.command}")

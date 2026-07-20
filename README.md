@@ -96,6 +96,18 @@ Open `http://127.0.0.1:8000` to review findings in the browser.
 
 The web app now uses signed session cookies. Start by creating a team workspace from `/login`, then sign in and onboard watched repos from the dashboard.
 
+Run the background scan worker for the current team:
+
+```bash
+python3 watchman.py --team-slug blue-team --team-name "Blue Team" run-worker
+```
+
+Run background scans for every team with active watched repos:
+
+```bash
+python3 watchman.py run-worker --all-teams
+```
+
 Scan a single repository:
 
 ```bash
@@ -129,6 +141,7 @@ Noise reduction and alert delivery:
 - matching suppressions downgrade known-safe findings to low risk and prevent alert delivery
 - high-confidence unsuppressed findings are written to `alerts/alerts.jsonl`
 - if `ALERT_WEBHOOK_URL` is set, the same alert payload is also posted to that webhook
+- alert delivery attempts are also persisted in the database with per-channel status and retry counts
 
 ## Service API
 
@@ -144,9 +157,15 @@ The repo now includes a product-facing FastAPI service:
 - `GET /api/findings/{id}`
 - `POST /api/findings/{id}/triage`
 - `GET /api/alerts`
+- `GET /api/alert-deliveries`
+- `GET /api/settings`
+- `POST /api/settings`
 - `GET /api/watchlist`
 - `POST /api/watchlist`
 - `POST /api/watchlist/{id}/deactivate`
+- `POST /api/watchlist/{id}/scan-now`
+- `GET /api/scan-runs`
+- `POST /api/scans/run-cycle`
 - `POST /api/demo/test-scan`
 
 The app no longer trusts caller-provided identity headers. Team and user context come from a signed session cookie that is created during login or registration.
@@ -157,9 +176,14 @@ The browser dashboard at `/` provides:
 - full finding detail
 - triage updates
 - alert inbox visibility
+- alert delivery attempt visibility
 - a one-click synthetic demo scan
 - authenticated team and analyst context in the UI
 - repo onboarding and watchlist management
+- per-team alert thresholds and webhook settings
+- team scan interval controls plus watchlist scheduling state
+- recent scan run history
+- manual scan-now and team scan-cycle actions
 - backend visibility so you can tell whether the app is using SQLite or PostgreSQL
 
 Historical context is automatically applied during analysis when prior findings exist for the same repo/file and matching rule hits:
@@ -194,6 +218,11 @@ Findings are stored behind an abstract store layer:
 - `teams`, `users`, and `team_memberships` establish ownership
 - `users` now store password hashes for local account login
 - `repo_watchlists` persist team-owned repository onboarding state
+- `team_settings` persist per-team alert thresholds, webhook routing, and scan limits
+- `team_settings` also persist scan interval settings for scheduled execution
+- `scan_runs` persist background/manual scan execution history plus lock expiry metadata
+- `alert_deliveries` persist per-channel delivery attempts, failures, and retry counts
+- `repo_watchlists` also track next scan time, last successful scan, and last scan error
 - `commits` are scoped by `team_id + repo_name + commit_sha`
 - `findings` store:
   - file name
@@ -232,3 +261,7 @@ This version adds a few product-oriented building blocks:
 - team and analyst ownership threaded through scans, findings, and triage
 - local authentication plus signed sessions for the web app
 - repo watchlist onboarding persisted in the database
+- background scan worker orchestration with persisted scan runs
+- per-team alert settings for risk/confidence thresholds, webhook routing, and scan intervals
+- overlap protection so a repo cannot be scanned twice at the same time
+- delivery reliability tracking so webhook failures are visible in the app
