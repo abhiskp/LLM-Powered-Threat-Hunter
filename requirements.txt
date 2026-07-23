@@ -1,4 +1,4 @@
-fastapi>=0.128.8
+fastapi>=0.139.2
 openai>=2.36.0
 PyGithub>=2.9.1
 python-dotenv>=1.0.0
