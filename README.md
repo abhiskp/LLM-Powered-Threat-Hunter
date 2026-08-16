@@ -142,6 +142,8 @@ Noise reduction and alert delivery:
 - high-confidence unsuppressed findings are written to `alerts/alerts.jsonl`
 - if `ALERT_WEBHOOK_URL` is set, the same alert payload is also posted to that webhook
 - alert delivery attempts are also persisted in the database with per-channel status and retry counts
+- teams can now configure first-class alert destinations, starting with Slack incoming webhooks
+- failed destination sends are retried with backoff and eventually moved to a dead-letter state
 
 ## Service API
 
@@ -158,6 +160,11 @@ The repo now includes a product-facing FastAPI service:
 - `POST /api/findings/{id}/triage`
 - `GET /api/alerts`
 - `GET /api/alert-deliveries`
+- `GET /api/alert-destinations`
+- `POST /api/alert-destinations`
+- `POST /api/alert-destinations/{id}/deactivate`
+- `POST /api/alert-destinations/{id}/test`
+- `POST /api/alerts/process-queue`
 - `GET /api/settings`
 - `POST /api/settings`
 - `GET /api/watchlist`
@@ -177,11 +184,13 @@ The browser dashboard at `/` provides:
 - triage updates
 - alert inbox visibility
 - alert delivery attempt visibility
+- alert destination management and test-alert actions
 - a one-click synthetic demo scan
 - authenticated team and analyst context in the UI
 - repo onboarding and watchlist management
 - per-team alert thresholds and webhook settings
 - team scan interval controls plus watchlist scheduling state
+- a manual delivery-queue run action for demo and operational testing
 - recent scan run history
 - manual scan-now and team scan-cycle actions
 - backend visibility so you can tell whether the app is using SQLite or PostgreSQL
@@ -222,6 +231,7 @@ Findings are stored behind an abstract store layer:
 - `team_settings` also persist scan interval settings for scheduled execution
 - `scan_runs` persist background/manual scan execution history plus lock expiry metadata
 - `alert_deliveries` persist per-channel delivery attempts, failures, and retry counts
+- `alert_destinations` persist team-owned outbound routes such as Slack webhooks
 - `repo_watchlists` also track next scan time, last successful scan, and last scan error
 - `commits` are scoped by `team_id + repo_name + commit_sha`
 - `findings` store:
@@ -265,3 +275,10 @@ This version adds a few product-oriented building blocks:
 - per-team alert settings for risk/confidence thresholds, webhook routing, and scan intervals
 - overlap protection so a repo cannot be scanned twice at the same time
 - delivery reliability tracking so webhook failures are visible in the app
+- first-class Slack webhook destinations with queued delivery processing and retries
+
+Run the delivery worker manually with:
+
+```bash
+python3 watchman.py run-delivery-worker
+```
