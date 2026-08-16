@@ -53,6 +53,8 @@ DEFAULT_ALERT_MIN_CONFIDENCE = int(os.getenv("ALERT_MIN_CONFIDENCE", "80"))
 DEFAULT_SCAN_LIMIT = int(os.getenv("WATCHMAN_SCAN_LIMIT", "3"))
 DEFAULT_SCAN_INTERVAL_MINUTES = int(os.getenv("WATCHMAN_SCAN_INTERVAL_MINUTES", "60"))
 DEFAULT_SCAN_LOCK_MINUTES = int(os.getenv("WATCHMAN_SCAN_LOCK_MINUTES", "30"))
+DEFAULT_DELIVERY_RETRY_LIMIT = int(os.getenv("WATCHMAN_DELIVERY_RETRY_LIMIT", "3"))
+DEFAULT_DELIVERY_RETRY_BASE_MINUTES = int(os.getenv("WATCHMAN_DELIVERY_RETRY_BASE_MINUTES", "5"))
 
 
 def utc_now_iso() -> str:
@@ -307,6 +309,87 @@ class BaseStoreBackend(ABC):
     ) -> List[Dict[str, Any]]:
         raise NotImplementedError
 
+    @abstractmethod
+    def list_alert_destinations(
+        self,
+        ownership: OwnershipContext,
+        active_only: bool = True,
+    ) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def add_alert_destination(
+        self,
+        ownership: OwnershipContext,
+        kind: str,
+        name: str,
+        target_url: str,
+    ) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def deactivate_alert_destination(
+        self,
+        ownership: OwnershipContext,
+        destination_id: int,
+    ) -> bool:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_alert_destination(
+        self,
+        ownership: OwnershipContext,
+        destination_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def enqueue_alert_delivery(
+        self,
+        ownership: OwnershipContext,
+        repo_name: str,
+        commit_sha: str,
+        file_name: str,
+        channel: str,
+        destination: str,
+        payload: Dict[str, Any],
+        destination_id: Optional[int] = None,
+        status: str = "pending",
+        error_message: Optional[str] = None,
+        next_attempt_at: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def update_alert_delivery_status(
+        self,
+        delivery_id: int,
+        *,
+        status: str,
+        error_message: Optional[str] = None,
+        next_attempt_at: Optional[str] = None,
+        increment_attempt: bool = True,
+    ) -> bool:
+        raise NotImplementedError
+
+    @abstractmethod
+    def list_pending_alert_deliveries(
+        self,
+        *,
+        team_slug: Optional[str] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def record_alert_destination_result(
+        self,
+        destination_id: int,
+        *,
+        error_message: Optional[str] = None,
+    ) -> bool:
+        raise NotImplementedError
+
 
 class SQLiteStoreBackend(BaseStoreBackend):
     backend_name = "sqlite"
@@ -440,19 +523,41 @@ class SQLiteStoreBackend(BaseStoreBackend):
                     FOREIGN KEY(scanner_user_id) REFERENCES users(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS alert_destinations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    team_id INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    target_url TEXT NOT NULL,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_tested_at TEXT,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    UNIQUE(team_id, name),
+                    FOREIGN KEY(team_id) REFERENCES teams(id)
+                );
+
                 CREATE TABLE IF NOT EXISTS alert_deliveries (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     team_id INTEGER NOT NULL,
+                    destination_id INTEGER,
                     repo_name TEXT NOT NULL,
                     commit_sha TEXT NOT NULL,
                     file_name TEXT NOT NULL,
                     channel TEXT NOT NULL,
                     destination TEXT NOT NULL,
                     status TEXT NOT NULL,
-                    attempt_number INTEGER NOT NULL DEFAULT 1,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    attempt_number INTEGER NOT NULL DEFAULT 0,
+                    last_attempt_at TEXT,
+                    next_attempt_at TEXT,
+                    delivered_at TEXT,
                     error_message TEXT,
                     created_at TEXT NOT NULL,
-                    FOREIGN KEY(team_id) REFERENCES teams(id)
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(team_id) REFERENCES teams(id),
+                    FOREIGN KEY(destination_id) REFERENCES alert_destinations(id)
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_commits_team_repo_sha
@@ -468,6 +573,10 @@ class SQLiteStoreBackend(BaseStoreBackend):
                     WHERE status = 'running';
                 CREATE INDEX IF NOT EXISTS idx_alert_deliveries_team_created
                     ON alert_deliveries(team_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_alert_deliveries_pending
+                    ON alert_deliveries(status, next_attempt_at ASC);
+                CREATE INDEX IF NOT EXISTS idx_alert_destinations_team_active
+                    ON alert_destinations(team_id, is_active, kind);
                 """
             )
             self._migrate_existing_schema(connection)
@@ -557,19 +666,70 @@ class SQLiteStoreBackend(BaseStoreBackend):
             CREATE TABLE IF NOT EXISTS alert_deliveries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 team_id INTEGER NOT NULL,
+                destination_id INTEGER,
                 repo_name TEXT NOT NULL,
                 commit_sha TEXT NOT NULL,
                 file_name TEXT NOT NULL,
                 channel TEXT NOT NULL,
                 destination TEXT NOT NULL,
                 status TEXT NOT NULL,
-                attempt_number INTEGER NOT NULL DEFAULT 1,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                attempt_number INTEGER NOT NULL DEFAULT 0,
+                last_attempt_at TEXT,
+                next_attempt_at TEXT,
+                delivered_at TEXT,
                 error_message TEXT,
                 created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(team_id) REFERENCES teams(id),
+                FOREIGN KEY(destination_id) REFERENCES alert_destinations(id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS alert_destinations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                team_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                name TEXT NOT NULL,
+                target_url TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_tested_at TEXT,
+                last_error TEXT NOT NULL DEFAULT '',
+                UNIQUE(team_id, name),
                 FOREIGN KEY(team_id) REFERENCES teams(id)
             )
             """
         )
+        alert_delivery_columns = self._table_columns(connection, "alert_deliveries")
+        if alert_delivery_columns:
+            if "destination_id" not in alert_delivery_columns:
+                connection.execute("ALTER TABLE alert_deliveries ADD COLUMN destination_id INTEGER")
+            if "payload_json" not in alert_delivery_columns:
+                connection.execute(
+                    "ALTER TABLE alert_deliveries ADD COLUMN payload_json TEXT NOT NULL DEFAULT '{}'"
+                )
+            if "last_attempt_at" not in alert_delivery_columns:
+                connection.execute("ALTER TABLE alert_deliveries ADD COLUMN last_attempt_at TEXT")
+            if "next_attempt_at" not in alert_delivery_columns:
+                connection.execute("ALTER TABLE alert_deliveries ADD COLUMN next_attempt_at TEXT")
+            if "delivered_at" not in alert_delivery_columns:
+                connection.execute("ALTER TABLE alert_deliveries ADD COLUMN delivered_at TEXT")
+            if "updated_at" not in alert_delivery_columns:
+                connection.execute(
+                    "ALTER TABLE alert_deliveries ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''"
+                )
+        alert_destination_columns = self._table_columns(connection, "alert_destinations")
+        if alert_destination_columns:
+            if "last_tested_at" not in alert_destination_columns:
+                connection.execute("ALTER TABLE alert_destinations ADD COLUMN last_tested_at TEXT")
+            if "last_error" not in alert_destination_columns:
+                connection.execute(
+                    "ALTER TABLE alert_destinations ADD COLUMN last_error TEXT NOT NULL DEFAULT ''"
+                )
         connection.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_runs_running_lock
@@ -581,6 +741,18 @@ class SQLiteStoreBackend(BaseStoreBackend):
             """
             CREATE INDEX IF NOT EXISTS idx_alert_deliveries_team_created
                 ON alert_deliveries(team_id, created_at DESC)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_alert_deliveries_pending
+                ON alert_deliveries(status, next_attempt_at ASC)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_alert_destinations_team_active
+                ON alert_destinations(team_id, is_active, kind)
             """
         )
         connection.execute(
@@ -598,6 +770,20 @@ class SQLiteStoreBackend(BaseStoreBackend):
             SET scan_interval_minutes = COALESCE(scan_interval_minutes, ?)
             """,
             (DEFAULT_SCAN_INTERVAL_MINUTES,),
+        )
+        connection.execute(
+            """
+            UPDATE alert_deliveries
+            SET payload_json = COALESCE(payload_json, '{}'),
+                updated_at = CASE
+                    WHEN updated_at IS NULL OR updated_at = '' THEN created_at
+                    ELSE updated_at
+                END,
+                attempt_number = CASE
+                    WHEN attempt_number IS NULL THEN 0
+                    ELSE attempt_number
+                END
+            """
         )
 
     @staticmethod
@@ -1680,17 +1866,23 @@ class SQLiteStoreBackend(BaseStoreBackend):
                 """
                 INSERT INTO alert_deliveries (
                     team_id,
+                    destination_id,
                     repo_name,
                     commit_sha,
                     file_name,
                     channel,
                     destination,
                     status,
+                    payload_json,
                     attempt_number,
+                    last_attempt_at,
+                    next_attempt_at,
+                    delivered_at,
                     error_message,
-                    created_at
+                    created_at,
+                    updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, NULL, ?, ?, ?, ?, ?, ?, '{}', ?, ?, NULL, ?, ?, ?, ?)
                 """,
                 (
                     resolved.team_id,
@@ -1701,7 +1893,10 @@ class SQLiteStoreBackend(BaseStoreBackend):
                     destination,
                     normalized_status,
                     attempt_number,
+                    created_at,
+                    created_at if normalized_status == "delivered" else None,
                     (error_message or "").strip() or None,
+                    created_at,
                     created_at,
                 ),
             )
@@ -1716,6 +1911,78 @@ class SQLiteStoreBackend(BaseStoreBackend):
             "attempt_number": attempt_number,
             "error_message": (error_message or "").strip() or None,
             "created_at": created_at,
+            "updated_at": created_at,
+        }
+
+    def enqueue_alert_delivery(
+        self,
+        ownership: OwnershipContext,
+        repo_name: str,
+        commit_sha: str,
+        file_name: str,
+        channel: str,
+        destination: str,
+        payload: Dict[str, Any],
+        destination_id: Optional[int] = None,
+        status: str = "pending",
+        error_message: Optional[str] = None,
+        next_attempt_at: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        resolved = self.resolve_ownership(ownership)
+        normalized_status = normalize_delivery_status(status)
+        created_at = utc_now_iso()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO alert_deliveries (
+                    team_id,
+                    destination_id,
+                    repo_name,
+                    commit_sha,
+                    file_name,
+                    channel,
+                    destination,
+                    status,
+                    payload_json,
+                    attempt_number,
+                    last_attempt_at,
+                    next_attempt_at,
+                    delivered_at,
+                    error_message,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, NULL, ?, ?, ?)
+                """,
+                (
+                    resolved.team_id,
+                    destination_id,
+                    repo_name,
+                    commit_sha,
+                    file_name,
+                    channel,
+                    destination,
+                    normalized_status,
+                    json_dumps(payload),
+                    next_attempt_at or created_at,
+                    (error_message or "").strip() or None,
+                    created_at,
+                    created_at,
+                ),
+            )
+        return {
+            "id": int(cursor.lastrowid),
+            "destination_id": destination_id,
+            "repo_name": repo_name,
+            "commit_sha": commit_sha,
+            "file_name": file_name,
+            "channel": channel,
+            "destination": destination,
+            "status": normalized_status,
+            "attempt_number": 0,
+            "error_message": (error_message or "").strip() or None,
+            "created_at": created_at,
+            "next_attempt_at": next_attempt_at or created_at,
         }
 
     def list_alert_deliveries(
@@ -1729,6 +1996,7 @@ class SQLiteStoreBackend(BaseStoreBackend):
                 """
                 SELECT
                     id,
+                    destination_id,
                     repo_name,
                     commit_sha,
                     file_name,
@@ -1736,8 +2004,11 @@ class SQLiteStoreBackend(BaseStoreBackend):
                     destination,
                     status,
                     attempt_number,
+                    next_attempt_at,
+                    delivered_at,
                     error_message,
-                    created_at
+                    created_at,
+                    updated_at
                 FROM alert_deliveries
                 WHERE team_id = ?
                 ORDER BY created_at DESC, id DESC
@@ -1746,6 +2017,268 @@ class SQLiteStoreBackend(BaseStoreBackend):
                 (resolved.team_id, limit),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def list_alert_destinations(
+        self,
+        ownership: OwnershipContext,
+        active_only: bool = True,
+    ) -> List[Dict[str, Any]]:
+        resolved = self.resolve_ownership(ownership)
+        query = """
+            SELECT
+                id,
+                team_id,
+                kind,
+                name,
+                target_url,
+                is_active,
+                created_at,
+                updated_at,
+                last_tested_at,
+                last_error
+            FROM alert_destinations
+            WHERE team_id = ?
+        """
+        params: List[Any] = [resolved.team_id]
+        if active_only:
+            query += " AND is_active = 1"
+        query += " ORDER BY created_at DESC, id DESC"
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        payload = [dict(row) for row in rows]
+        for row in payload:
+            row["is_active"] = bool(row["is_active"])
+        return payload
+
+    def add_alert_destination(
+        self,
+        ownership: OwnershipContext,
+        kind: str,
+        name: str,
+        target_url: str,
+    ) -> Dict[str, Any]:
+        resolved = self.resolve_ownership(ownership)
+        normalized_kind = normalize_destination_kind(kind)
+        normalized_name = name.strip()
+        normalized_target_url = target_url.strip()
+        if not normalized_name:
+            raise ValueError("Destination name is required.")
+        if not normalized_target_url:
+            raise ValueError("Destination target URL is required.")
+        now = utc_now_iso()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO alert_destinations (
+                    team_id,
+                    kind,
+                    name,
+                    target_url,
+                    is_active,
+                    created_at,
+                    updated_at,
+                    last_tested_at,
+                    last_error
+                )
+                VALUES (?, ?, ?, ?, 1, ?, ?, NULL, '')
+                ON CONFLICT(team_id, name) DO UPDATE SET
+                    kind = excluded.kind,
+                    target_url = excluded.target_url,
+                    is_active = 1,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    resolved.team_id,
+                    normalized_kind,
+                    normalized_name,
+                    normalized_target_url,
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT
+                    id,
+                    team_id,
+                    kind,
+                    name,
+                    target_url,
+                    is_active,
+                    created_at,
+                    updated_at,
+                    last_tested_at,
+                    last_error
+                FROM alert_destinations
+                WHERE team_id = ? AND name = ?
+                """,
+                (resolved.team_id, normalized_name),
+            ).fetchone()
+        if row is None:
+            raise ValueError("Unable to persist alert destination.")
+        payload = dict(row)
+        payload["is_active"] = bool(payload["is_active"])
+        return payload
+
+    def deactivate_alert_destination(
+        self,
+        ownership: OwnershipContext,
+        destination_id: int,
+    ) -> bool:
+        resolved = self.resolve_ownership(ownership)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE alert_destinations
+                SET is_active = 0,
+                    updated_at = ?
+                WHERE id = ? AND team_id = ?
+                """,
+                (utc_now_iso(), destination_id, resolved.team_id),
+            )
+        return cursor.rowcount > 0
+
+    def get_alert_destination(
+        self,
+        ownership: OwnershipContext,
+        destination_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        resolved = self.resolve_ownership(ownership)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    id,
+                    team_id,
+                    kind,
+                    name,
+                    target_url,
+                    is_active,
+                    created_at,
+                    updated_at,
+                    last_tested_at,
+                    last_error
+                FROM alert_destinations
+                WHERE id = ? AND team_id = ?
+                """,
+                (destination_id, resolved.team_id),
+            ).fetchone()
+        if row is None:
+            return None
+        payload = dict(row)
+        payload["is_active"] = bool(payload["is_active"])
+        return payload
+
+    def update_alert_delivery_status(
+        self,
+        delivery_id: int,
+        *,
+        status: str,
+        error_message: Optional[str] = None,
+        next_attempt_at: Optional[str] = None,
+        increment_attempt: bool = True,
+    ) -> bool:
+        normalized_status = normalize_delivery_status(status)
+        updated_at = utc_now_iso()
+        last_attempt_at = updated_at if increment_attempt else None
+        delivered_at = updated_at if normalized_status == "delivered" else None
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE alert_deliveries
+                SET status = ?,
+                    error_message = ?,
+                    next_attempt_at = ?,
+                    delivered_at = ?,
+                    updated_at = ?,
+                    last_attempt_at = CASE WHEN ? THEN ? ELSE last_attempt_at END,
+                    attempt_number = CASE WHEN ? THEN attempt_number + 1 ELSE attempt_number END
+                WHERE id = ?
+                """,
+                (
+                    normalized_status,
+                    (error_message or "").strip() or None,
+                    next_attempt_at,
+                    delivered_at,
+                    updated_at,
+                    1 if increment_attempt else 0,
+                    last_attempt_at,
+                    1 if increment_attempt else 0,
+                    delivery_id,
+                ),
+            )
+        return cursor.rowcount > 0
+
+    def list_pending_alert_deliveries(
+        self,
+        *,
+        team_slug: Optional[str] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        now = utc_now_iso()
+        query = """
+            SELECT
+                alert_deliveries.id,
+                alert_deliveries.team_id,
+                teams.slug AS team_slug,
+                teams.name AS team_name,
+                alert_deliveries.destination_id,
+                alert_deliveries.repo_name,
+                alert_deliveries.commit_sha,
+                alert_deliveries.file_name,
+                alert_deliveries.channel,
+                alert_deliveries.destination,
+                alert_deliveries.status,
+                alert_deliveries.payload_json,
+                alert_deliveries.attempt_number,
+                alert_deliveries.last_attempt_at,
+                alert_deliveries.next_attempt_at,
+                alert_deliveries.error_message,
+                alert_deliveries.created_at,
+                alert_deliveries.updated_at,
+                alert_destinations.kind AS destination_kind,
+                alert_destinations.name AS destination_name,
+                alert_destinations.target_url
+            FROM alert_deliveries
+            JOIN teams ON alert_deliveries.team_id = teams.id
+            LEFT JOIN alert_destinations ON alert_deliveries.destination_id = alert_destinations.id
+            WHERE alert_deliveries.status IN ('pending', 'failed')
+              AND (alert_deliveries.next_attempt_at IS NULL OR alert_deliveries.next_attempt_at <= ?)
+        """
+        params: List[Any] = [now]
+        if team_slug:
+            query += " AND teams.slug = ?"
+            params.append(team_slug)
+        query += " ORDER BY alert_deliveries.next_attempt_at ASC, alert_deliveries.id ASC LIMIT ?"
+        params.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_alert_destination_result(
+        self,
+        destination_id: int,
+        *,
+        error_message: Optional[str] = None,
+    ) -> bool:
+        now = utc_now_iso()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE alert_destinations
+                SET last_tested_at = ?,
+                    last_error = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    now,
+                    (error_message or "").strip(),
+                    now,
+                    destination_id,
+                ),
+            )
+        return cursor.rowcount > 0
 
     @staticmethod
     def _json(value: Any) -> str:
@@ -1889,18 +2422,38 @@ class PostgresStoreBackend(BaseStoreBackend):
                         scanner_user_id BIGINT REFERENCES users(id)
                     );
 
+                    CREATE TABLE IF NOT EXISTS alert_destinations (
+                        id BIGSERIAL PRIMARY KEY,
+                        team_id BIGINT NOT NULL REFERENCES teams(id),
+                        kind TEXT NOT NULL,
+                        name TEXT NOT NULL,
+                        target_url TEXT NOT NULL,
+                        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        last_tested_at TEXT,
+                        last_error TEXT NOT NULL DEFAULT '',
+                        UNIQUE(team_id, name)
+                    );
+
                     CREATE TABLE IF NOT EXISTS alert_deliveries (
                         id BIGSERIAL PRIMARY KEY,
                         team_id BIGINT NOT NULL REFERENCES teams(id),
+                        destination_id BIGINT REFERENCES alert_destinations(id),
                         repo_name TEXT NOT NULL,
                         commit_sha TEXT NOT NULL,
                         file_name TEXT NOT NULL,
                         channel TEXT NOT NULL,
                         destination TEXT NOT NULL,
                         status TEXT NOT NULL,
-                        attempt_number INTEGER NOT NULL DEFAULT 1,
+                        payload_json TEXT NOT NULL DEFAULT '{}',
+                        attempt_number INTEGER NOT NULL DEFAULT 0,
+                        last_attempt_at TEXT,
+                        next_attempt_at TEXT,
+                        delivered_at TEXT,
                         error_message TEXT,
-                        created_at TEXT NOT NULL
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
                     );
 
                     CREATE INDEX IF NOT EXISTS idx_scan_runs_team_started
@@ -1910,6 +2463,10 @@ class PostgresStoreBackend(BaseStoreBackend):
                         WHERE status = 'running';
                     CREATE INDEX IF NOT EXISTS idx_alert_deliveries_team_created
                         ON alert_deliveries(team_id, created_at DESC);
+                    CREATE INDEX IF NOT EXISTS idx_alert_deliveries_pending
+                        ON alert_deliveries(status, next_attempt_at ASC);
+                    CREATE INDEX IF NOT EXISTS idx_alert_destinations_team_active
+                        ON alert_destinations(team_id, is_active, kind);
                     """
                 )
                 cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_salt TEXT")
@@ -1929,6 +2486,20 @@ class PostgresStoreBackend(BaseStoreBackend):
                     "ALTER TABLE team_settings ADD COLUMN IF NOT EXISTS scan_interval_minutes INTEGER NOT NULL DEFAULT 60"
                 )
                 cursor.execute("ALTER TABLE scan_runs ADD COLUMN IF NOT EXISTS lock_expires_at TEXT")
+                cursor.execute("ALTER TABLE alert_deliveries ADD COLUMN IF NOT EXISTS destination_id BIGINT")
+                cursor.execute(
+                    "ALTER TABLE alert_deliveries ADD COLUMN IF NOT EXISTS payload_json TEXT NOT NULL DEFAULT '{}'"
+                )
+                cursor.execute("ALTER TABLE alert_deliveries ADD COLUMN IF NOT EXISTS last_attempt_at TEXT")
+                cursor.execute("ALTER TABLE alert_deliveries ADD COLUMN IF NOT EXISTS next_attempt_at TEXT")
+                cursor.execute("ALTER TABLE alert_deliveries ADD COLUMN IF NOT EXISTS delivered_at TEXT")
+                cursor.execute(
+                    "ALTER TABLE alert_deliveries ADD COLUMN IF NOT EXISTS updated_at TEXT NOT NULL DEFAULT ''"
+                )
+                cursor.execute("ALTER TABLE alert_destinations ADD COLUMN IF NOT EXISTS last_tested_at TEXT")
+                cursor.execute(
+                    "ALTER TABLE alert_destinations ADD COLUMN IF NOT EXISTS last_error TEXT NOT NULL DEFAULT ''"
+                )
                 cursor.execute(
                     """
                     UPDATE repo_watchlists
@@ -1945,6 +2516,17 @@ class PostgresStoreBackend(BaseStoreBackend):
                     SET scan_interval_minutes = COALESCE(scan_interval_minutes, %s)
                     """,
                     (DEFAULT_SCAN_INTERVAL_MINUTES,),
+                )
+                cursor.execute(
+                    """
+                    UPDATE alert_deliveries
+                    SET payload_json = COALESCE(payload_json, '{}'),
+                        updated_at = CASE
+                            WHEN updated_at IS NULL OR updated_at = '' THEN created_at
+                            ELSE updated_at
+                        END,
+                        attempt_number = COALESCE(attempt_number, 0)
+                    """
                 )
             connection.commit()
 
@@ -3001,6 +3583,7 @@ class PostgresStoreBackend(BaseStoreBackend):
     ) -> Dict[str, Any]:
         resolved = self.resolve_ownership(ownership)
         normalized_status = normalize_delivery_status(status)
+        created_at = utc_now_iso()
         with self._connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -3025,22 +3608,27 @@ class PostgresStoreBackend(BaseStoreBackend):
                 )
                 row = cursor.fetchone()
                 attempt_number = int(row["last_attempt"]) + 1
-                created_at = utc_now_iso()
                 cursor.execute(
                     """
                     INSERT INTO alert_deliveries (
                         team_id,
+                        destination_id,
                         repo_name,
                         commit_sha,
                         file_name,
                         channel,
                         destination,
                         status,
+                        payload_json,
                         attempt_number,
+                        last_attempt_at,
+                        next_attempt_at,
+                        delivered_at,
                         error_message,
-                        created_at
+                        created_at,
+                        updated_at
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, NULL, %s, %s, %s, %s, %s, %s, '{}', %s, %s, NULL, %s, %s, %s, %s)
                     RETURNING id
                     """,
                     (
@@ -3052,7 +3640,10 @@ class PostgresStoreBackend(BaseStoreBackend):
                         destination,
                         normalized_status,
                         attempt_number,
+                        created_at,
+                        created_at if normalized_status == "delivered" else None,
                         (error_message or "").strip() or None,
+                        created_at,
                         created_at,
                     ),
                 )
@@ -3069,6 +3660,82 @@ class PostgresStoreBackend(BaseStoreBackend):
             "attempt_number": attempt_number,
             "error_message": (error_message or "").strip() or None,
             "created_at": created_at,
+            "updated_at": created_at,
+        }
+
+    def enqueue_alert_delivery(
+        self,
+        ownership: OwnershipContext,
+        repo_name: str,
+        commit_sha: str,
+        file_name: str,
+        channel: str,
+        destination: str,
+        payload: Dict[str, Any],
+        destination_id: Optional[int] = None,
+        status: str = "pending",
+        error_message: Optional[str] = None,
+        next_attempt_at: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        resolved = self.resolve_ownership(ownership)
+        normalized_status = normalize_delivery_status(status)
+        created_at = utc_now_iso()
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO alert_deliveries (
+                        team_id,
+                        destination_id,
+                        repo_name,
+                        commit_sha,
+                        file_name,
+                        channel,
+                        destination,
+                        status,
+                        payload_json,
+                        attempt_number,
+                        last_attempt_at,
+                        next_attempt_at,
+                        delivered_at,
+                        error_message,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 0, NULL, %s, NULL, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        resolved.team_id,
+                        destination_id,
+                        repo_name,
+                        commit_sha,
+                        file_name,
+                        channel,
+                        destination,
+                        normalized_status,
+                        json_dumps(payload),
+                        next_attempt_at or created_at,
+                        (error_message or "").strip() or None,
+                        created_at,
+                        created_at,
+                    ),
+                )
+                inserted = cursor.fetchone()
+            connection.commit()
+        return {
+            "id": int(inserted["id"]),
+            "destination_id": destination_id,
+            "repo_name": repo_name,
+            "commit_sha": commit_sha,
+            "file_name": file_name,
+            "channel": channel,
+            "destination": destination,
+            "status": normalized_status,
+            "attempt_number": 0,
+            "error_message": (error_message or "").strip() or None,
+            "created_at": created_at,
+            "next_attempt_at": next_attempt_at or created_at,
         }
 
     def list_alert_deliveries(
@@ -3083,6 +3750,7 @@ class PostgresStoreBackend(BaseStoreBackend):
                     """
                     SELECT
                         id,
+                        destination_id,
                         repo_name,
                         commit_sha,
                         file_name,
@@ -3090,8 +3758,11 @@ class PostgresStoreBackend(BaseStoreBackend):
                         destination,
                         status,
                         attempt_number,
+                        next_attempt_at,
+                        delivered_at,
                         error_message,
-                        created_at
+                        created_at,
+                        updated_at
                     FROM alert_deliveries
                     WHERE team_id = %s
                     ORDER BY created_at DESC, id DESC
@@ -3100,6 +3771,275 @@ class PostgresStoreBackend(BaseStoreBackend):
                     (resolved.team_id, limit),
                 )
                 return [dict(row) for row in cursor.fetchall()]
+
+    def list_alert_destinations(
+        self,
+        ownership: OwnershipContext,
+        active_only: bool = True,
+    ) -> List[Dict[str, Any]]:
+        resolved = self.resolve_ownership(ownership)
+        query = """
+            SELECT
+                id,
+                team_id,
+                kind,
+                name,
+                target_url,
+                is_active,
+                created_at,
+                updated_at,
+                last_tested_at,
+                last_error
+            FROM alert_destinations
+            WHERE team_id = %s
+        """
+        params: List[Any] = [resolved.team_id]
+        if active_only:
+            query += " AND is_active = TRUE"
+        query += " ORDER BY created_at DESC, id DESC"
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(query, params)
+                rows = [dict(row) for row in cursor.fetchall()]
+        for row in rows:
+            row["is_active"] = bool(row["is_active"])
+        return rows
+
+    def add_alert_destination(
+        self,
+        ownership: OwnershipContext,
+        kind: str,
+        name: str,
+        target_url: str,
+    ) -> Dict[str, Any]:
+        resolved = self.resolve_ownership(ownership)
+        normalized_kind = normalize_destination_kind(kind)
+        normalized_name = name.strip()
+        normalized_target_url = target_url.strip()
+        if not normalized_name:
+            raise ValueError("Destination name is required.")
+        if not normalized_target_url:
+            raise ValueError("Destination target URL is required.")
+        now = utc_now_iso()
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO alert_destinations (
+                        team_id,
+                        kind,
+                        name,
+                        target_url,
+                        is_active,
+                        created_at,
+                        updated_at,
+                        last_tested_at,
+                        last_error
+                    )
+                    VALUES (%s, %s, %s, %s, TRUE, %s, %s, NULL, '')
+                    ON CONFLICT (team_id, name) DO UPDATE SET
+                        kind = EXCLUDED.kind,
+                        target_url = EXCLUDED.target_url,
+                        is_active = TRUE,
+                        updated_at = EXCLUDED.updated_at
+                    RETURNING
+                        id,
+                        team_id,
+                        kind,
+                        name,
+                        target_url,
+                        is_active,
+                        created_at,
+                        updated_at,
+                        last_tested_at,
+                        last_error
+                    """,
+                    (
+                        resolved.team_id,
+                        normalized_kind,
+                        normalized_name,
+                        normalized_target_url,
+                        now,
+                        now,
+                    ),
+                )
+                row = cursor.fetchone()
+            connection.commit()
+        payload = dict(row)
+        payload["is_active"] = bool(payload["is_active"])
+        return payload
+
+    def deactivate_alert_destination(
+        self,
+        ownership: OwnershipContext,
+        destination_id: int,
+    ) -> bool:
+        resolved = self.resolve_ownership(ownership)
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE alert_destinations
+                    SET is_active = FALSE,
+                        updated_at = %s
+                    WHERE id = %s AND team_id = %s
+                    """,
+                    (utc_now_iso(), destination_id, resolved.team_id),
+                )
+                updated = cursor.rowcount > 0
+            connection.commit()
+        return updated
+
+    def get_alert_destination(
+        self,
+        ownership: OwnershipContext,
+        destination_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        resolved = self.resolve_ownership(ownership)
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        id,
+                        team_id,
+                        kind,
+                        name,
+                        target_url,
+                        is_active,
+                        created_at,
+                        updated_at,
+                        last_tested_at,
+                        last_error
+                    FROM alert_destinations
+                    WHERE id = %s AND team_id = %s
+                    """,
+                    (destination_id, resolved.team_id),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            return None
+        payload = dict(row)
+        payload["is_active"] = bool(payload["is_active"])
+        return payload
+
+    def update_alert_delivery_status(
+        self,
+        delivery_id: int,
+        *,
+        status: str,
+        error_message: Optional[str] = None,
+        next_attempt_at: Optional[str] = None,
+        increment_attempt: bool = True,
+    ) -> bool:
+        normalized_status = normalize_delivery_status(status)
+        updated_at = utc_now_iso()
+        last_attempt_at = updated_at if increment_attempt else None
+        delivered_at = updated_at if normalized_status == "delivered" else None
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE alert_deliveries
+                    SET status = %s,
+                        error_message = %s,
+                        next_attempt_at = %s,
+                        delivered_at = %s,
+                        updated_at = %s,
+                        last_attempt_at = CASE WHEN %s THEN %s ELSE last_attempt_at END,
+                        attempt_number = CASE WHEN %s THEN attempt_number + 1 ELSE attempt_number END
+                    WHERE id = %s
+                    """,
+                    (
+                        normalized_status,
+                        (error_message or "").strip() or None,
+                        next_attempt_at,
+                        delivered_at,
+                        updated_at,
+                        increment_attempt,
+                        last_attempt_at,
+                        increment_attempt,
+                        delivery_id,
+                    ),
+                )
+                updated = cursor.rowcount > 0
+            connection.commit()
+        return updated
+
+    def list_pending_alert_deliveries(
+        self,
+        *,
+        team_slug: Optional[str] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        now = utc_now_iso()
+        query = """
+            SELECT
+                alert_deliveries.id,
+                alert_deliveries.team_id,
+                teams.slug AS team_slug,
+                teams.name AS team_name,
+                alert_deliveries.destination_id,
+                alert_deliveries.repo_name,
+                alert_deliveries.commit_sha,
+                alert_deliveries.file_name,
+                alert_deliveries.channel,
+                alert_deliveries.destination,
+                alert_deliveries.status,
+                alert_deliveries.payload_json,
+                alert_deliveries.attempt_number,
+                alert_deliveries.last_attempt_at,
+                alert_deliveries.next_attempt_at,
+                alert_deliveries.error_message,
+                alert_deliveries.created_at,
+                alert_deliveries.updated_at,
+                alert_destinations.kind AS destination_kind,
+                alert_destinations.name AS destination_name,
+                alert_destinations.target_url
+            FROM alert_deliveries
+            JOIN teams ON alert_deliveries.team_id = teams.id
+            LEFT JOIN alert_destinations ON alert_deliveries.destination_id = alert_destinations.id
+            WHERE alert_deliveries.status IN ('pending', 'failed')
+              AND (alert_deliveries.next_attempt_at IS NULL OR alert_deliveries.next_attempt_at <= %s)
+        """
+        params: List[Any] = [now]
+        if team_slug:
+            query += " AND teams.slug = %s"
+            params.append(team_slug)
+        query += " ORDER BY alert_deliveries.next_attempt_at ASC, alert_deliveries.id ASC LIMIT %s"
+        params.append(limit)
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(query, params)
+                return [dict(row) for row in cursor.fetchall()]
+
+    def record_alert_destination_result(
+        self,
+        destination_id: int,
+        *,
+        error_message: Optional[str] = None,
+    ) -> bool:
+        now = utc_now_iso()
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE alert_destinations
+                    SET last_tested_at = %s,
+                        last_error = %s,
+                        updated_at = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        now,
+                        (error_message or "").strip(),
+                        now,
+                        destination_id,
+                    ),
+                )
+                updated = cursor.rowcount > 0
+            connection.commit()
+        return updated
 
 
 class FindingStore:
@@ -3192,8 +4132,15 @@ def normalize_scan_status(value: str) -> str:
 
 def normalize_delivery_status(value: str) -> str:
     normalized = (value or "").strip().lower()
-    if normalized not in {"delivered", "failed"}:
+    if normalized not in {"pending", "delivered", "failed", "dead_letter"}:
         raise ValueError("Invalid delivery status")
+    return normalized
+
+
+def normalize_destination_kind(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    if normalized not in {"slack_webhook"}:
+        raise ValueError("destination kind must be: slack_webhook")
     return normalized
 
 

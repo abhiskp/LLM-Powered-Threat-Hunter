@@ -1,11 +1,14 @@
 import json
 import tempfile
+import urllib.error
+from datetime import datetime, timezone
 from pathlib import Path
 
 import watchman
 from storage import infer_backend_name
 from testThreat import FAKE_PATCH
 from watchman import (
+    AlertDeliveryService,
     DetectionResult,
     FindingStore,
     ThreatHunter,
@@ -692,3 +695,113 @@ def test_claim_scan_run_blocks_overlap_until_completion(tmp_path: Path) -> None:
 
     third = store.claim_scan_run(team, watchlist["id"], "psf/requests", "manual")
     assert third is not None
+
+
+def test_alert_destinations_and_delivery_queue_process_slack_success(tmp_path: Path, monkeypatch) -> None:
+    store = FindingStore(tmp_path / "destinations.db")
+    team = ownership(team_slug="ops", team_name="Ops Team", user_email="ops@example.com", user_name="Olive")
+    store.register_account(
+        team_slug=team.team_slug,
+        team_name=team.team_name,
+        user_email=team.user_email,
+        user_name=team.user_name,
+        password="hunterpass123",
+    )
+    destination = store.add_alert_destination(
+        ownership=team,
+        kind="slack_webhook",
+        name="Primary Slack",
+        target_url="https://hooks.slack.com/services/T000/B000/XXX",
+    )
+
+    class DummyResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return b"ok"
+
+    monkeypatch.setattr(watchman.urllib.request, "urlopen", lambda request, timeout=10: DummyResponse())
+
+    delivery = deliver_alert(
+        ownership=team,
+        repo_name="psf/requests",
+        commit_sha="queue001",
+        file_name="requests/api.py",
+        result=DetectionResult(
+            risk="high",
+            confidence=98,
+            summary="Reverse shell behavior.",
+            reasons=["launches shell"],
+            indicators=["socket", "/bin/sh"],
+            rule_hits=["reverse-shell-pattern"],
+        ),
+        store=store,
+    )
+
+    assert delivery.delivered is True
+    rows = store.list_alert_deliveries(team, limit=10)
+    slack_rows = [row for row in rows if row.get("destination_id") == destination["id"]]
+    assert slack_rows
+    assert slack_rows[0]["status"] == "delivered"
+    assert slack_rows[0]["attempt_number"] == 1
+
+
+def test_alert_delivery_worker_dead_letters_after_retries(tmp_path: Path, monkeypatch) -> None:
+    store = FindingStore(tmp_path / "delivery-retries.db")
+    team = ownership(team_slug="ops", team_name="Ops Team", user_email="ops@example.com", user_name="Olive")
+    store.register_account(
+        team_slug=team.team_slug,
+        team_name=team.team_name,
+        user_email=team.user_email,
+        user_name=team.user_name,
+        password="hunterpass123",
+    )
+    destination = store.add_alert_destination(
+        ownership=team,
+        kind="slack_webhook",
+        name="Retry Slack",
+        target_url="https://hooks.slack.com/services/T000/B000/FAIL",
+    )
+    store.enqueue_alert_delivery(
+        ownership=team,
+        repo_name="psf/requests",
+        commit_sha="retry001",
+        file_name="requests/api.py",
+        channel="slack_webhook",
+        destination=destination["target_url"],
+        payload={
+            "repo_name": "psf/requests",
+            "commit_sha": "retry001",
+            "file_name": "requests/api.py",
+            "risk": "high",
+            "confidence": 99,
+            "summary": "Retry me.",
+            "indicators": ["test"],
+        },
+        destination_id=destination["id"],
+    )
+
+    monkeypatch.setattr(
+        watchman.urllib.request,
+        "urlopen",
+        lambda request, timeout=10: (_ for _ in ()).throw(urllib.error.URLError("slack down")),
+    )
+    monkeypatch.setattr(
+        AlertDeliveryService,
+        "_retry_at",
+        staticmethod(lambda attempt_number: datetime.now(timezone.utc).isoformat()),
+    )
+
+    service = AlertDeliveryService(store=store)
+    for _ in range(watchman.DELIVERY_RETRY_LIMIT):
+        service.process_cycle(team_slug=team.team_slug, limit=10)
+
+    rows = store.list_alert_deliveries(team, limit=10)
+    slack_rows = [row for row in rows if row.get("destination_id") == destination["id"]]
+    assert slack_rows
+    assert slack_rows[0]["status"] == "dead_letter"
+    assert slack_rows[0]["attempt_number"] == watchman.DELIVERY_RETRY_LIMIT

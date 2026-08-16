@@ -11,6 +11,7 @@ from storage import OwnershipRecord
 from testThreat import FAKE_PATCH
 from watchman import (
     ALERTS_LOG_PATH,
+    AlertDeliveryService,
     DATABASE_PATH,
     DATABASE_URL,
     BackgroundScanService,
@@ -34,6 +35,10 @@ def get_store() -> FindingStore:
 
 def get_scan_service(store: Optional[FindingStore] = None) -> BackgroundScanService:
     return BackgroundScanService(store=store or get_store())
+
+
+def get_delivery_service(store: Optional[FindingStore] = None) -> AlertDeliveryService:
+    return AlertDeliveryService(store=store or get_store())
 
 
 def record_to_ownership(record: OwnershipRecord) -> OwnershipContext:
@@ -145,6 +150,7 @@ def scan_run_to_payload(row: Dict[str, Any]) -> Dict[str, Any]:
 def alert_delivery_to_payload(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": row["id"],
+        "destination_id": row.get("destination_id"),
         "repo_name": row["repo_name"],
         "commit_sha": row["commit_sha"],
         "file_name": row["file_name"],
@@ -152,8 +158,25 @@ def alert_delivery_to_payload(row: Dict[str, Any]) -> Dict[str, Any]:
         "destination": row["destination"],
         "status": row["status"],
         "attempt_number": int(row["attempt_number"]),
+        "next_attempt_at": row.get("next_attempt_at"),
+        "delivered_at": row.get("delivered_at"),
         "error_message": row["error_message"],
         "created_at": row["created_at"],
+        "updated_at": row.get("updated_at"),
+    }
+
+
+def alert_destination_to_payload(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": row["id"],
+        "kind": row["kind"],
+        "name": row["name"],
+        "target_url": row["target_url"],
+        "is_active": bool(row["is_active"]),
+        "last_tested_at": row.get("last_tested_at"),
+        "last_error": row.get("last_error") or "",
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
     }
 
 
@@ -336,6 +359,7 @@ def render_dashboard_html(
     selected_finding: Optional[Dict[str, Any]],
     alerts: List[Dict[str, Any]],
     alert_deliveries: List[Dict[str, Any]],
+    alert_destinations: List[Dict[str, Any]],
     watchlist: List[Dict[str, Any]],
     team_settings: Dict[str, Any],
     scan_runs: List[Dict[str, Any]],
@@ -426,11 +450,34 @@ def render_dashboard_html(
         delivery_rows += f"""
         <tr>
           <td>{escape(delivery['created_at'])}</td>
+          <td>{escape(delivery.get('destination') or '')}</td>
           <td>{escape(delivery['repo_name'])}</td>
           <td>{escape(delivery['channel'])}</td>
           <td>{escape(delivery['status'])}</td>
           <td>{delivery['attempt_number']}</td>
           <td>{escape(delivery['error_message'] or '')}</td>
+        </tr>
+        """
+
+    destination_rows = ""
+    for destination in alert_destinations:
+        destination_rows += f"""
+        <tr>
+          <td>{escape(destination['name'])}</td>
+          <td>{escape(destination['kind'])}</td>
+          <td>{escape(destination['target_url'])}</td>
+          <td>{escape(destination.get('last_tested_at') or 'never')}</td>
+          <td>{escape(destination.get('last_error') or 'healthy')}</td>
+          <td>
+            <div class="inline-form">
+              <form method="post" action="/alert-destinations/{destination['id']}/test">
+                <button type="submit" class="small">Send Test</button>
+              </form>
+              <form method="post" action="/alert-destinations/{destination['id']}/deactivate">
+                <button type="submit" class="small danger">Deactivate</button>
+              </form>
+            </div>
+          </td>
         </tr>
         """
 
@@ -618,6 +665,9 @@ def render_dashboard_html(
             <form method="post" action="/scans/run-cycle">
               <button type="submit">Run Team Scan Cycle</button>
             </form>
+            <form method="post" action="/alerts/process-queue">
+              <button type="submit">Run Delivery Queue</button>
+            </form>
             <form method="get" action="/" class="filters">
               <select name="risk">
                 <option value="">All risks</option>
@@ -701,6 +751,29 @@ def render_dashboard_html(
                 </table>
               </div>
             </section>
+            <section class="panel">
+              <div class="panel-header"><strong>Alert Destinations</strong></div>
+              <div class="panel-body">
+                <form method="post" action="/alert-destinations" class="watchlist-form">
+                  <label>Destination Name<input type="text" name="name" placeholder="Primary Slack" required /></label>
+                  <label>Destination Type
+                    <select name="kind">
+                      <option value="slack_webhook">slack_webhook</option>
+                    </select>
+                  </label>
+                  <label>Target URL<input type="url" name="target_url" placeholder="https://hooks.slack.com/services/..." required /></label>
+                  <button type="submit">Add Destination</button>
+                </form>
+                <table class="watchlist-table" style="margin-top: 18px;">
+                  <thead>
+                    <tr><th>Name</th><th>Kind</th><th>Target</th><th>Last Tested</th><th>Last Error</th><th></th></tr>
+                  </thead>
+                  <tbody>
+                    {destination_rows or "<tr><td colspan='6' class='muted'>No alert destinations configured yet.</td></tr>"}
+                  </tbody>
+                </table>
+              </div>
+            </section>
           </div>
         </div>
 
@@ -726,11 +799,11 @@ def render_dashboard_html(
             <table class="inbox-table">
               <thead>
                 <tr>
-                  <th>Created</th><th>Repo</th><th>Channel</th><th>Status</th><th>Attempt</th><th>Error</th>
+                  <th>Created</th><th>Destination</th><th>Repo</th><th>Channel</th><th>Status</th><th>Attempt</th><th>Error</th>
                 </tr>
               </thead>
               <tbody>
-                {delivery_rows or "<tr><td colspan='6' class='muted'>No alert deliveries recorded yet.</td></tr>"}
+                {delivery_rows or "<tr><td colspan='7' class='muted'>No alert deliveries recorded yet.</td></tr>"}
               </tbody>
             </table>
           </div>
@@ -960,6 +1033,64 @@ def alert_deliveries_api(request: Request, limit: int = 20) -> Dict[str, Any]:
     return {"alert_deliveries": [alert_delivery_to_payload(row) for row in rows]}
 
 
+@app.get("/api/alert-destinations")
+def alert_destinations_api(request: Request) -> Dict[str, Any]:
+    store = get_store()
+    ownership = record_to_ownership(get_authenticated_record(request, store=store))
+    rows = store.list_alert_destinations(ownership=ownership, active_only=True)
+    return {"alert_destinations": [alert_destination_to_payload(row) for row in rows]}
+
+
+@app.post("/api/alert-destinations")
+def add_alert_destination_api(
+    request: Request,
+    name: str = Form(...),
+    kind: str = Form(...),
+    target_url: str = Form(...),
+) -> Dict[str, Any]:
+    store = get_store()
+    ownership = record_to_ownership(get_authenticated_record(request, store=store))
+    try:
+        row = store.add_alert_destination(
+            ownership=ownership,
+            name=name,
+            kind=kind,
+            target_url=target_url,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"alert_destination": alert_destination_to_payload(row)}
+
+
+@app.post("/api/alert-destinations/{destination_id}/deactivate")
+def deactivate_alert_destination_api(destination_id: int, request: Request) -> Dict[str, Any]:
+    store = get_store()
+    ownership = record_to_ownership(get_authenticated_record(request, store=store))
+    updated = store.deactivate_alert_destination(ownership=ownership, destination_id=destination_id)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Alert destination not found")
+    return {"updated": True}
+
+
+@app.post("/api/alert-destinations/{destination_id}/test")
+def test_alert_destination_api(destination_id: int, request: Request) -> Dict[str, Any]:
+    store = get_store()
+    ownership = record_to_ownership(get_authenticated_record(request, store=store))
+    try:
+        result = get_delivery_service(store=store).send_test_alert(ownership=ownership, destination_id=destination_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"delivery": result}
+
+
+@app.post("/api/alerts/process-queue")
+def process_alert_queue_api(request: Request, limit: int = 20) -> Dict[str, Any]:
+    store = get_store()
+    record = get_authenticated_record(request, store=store)
+    results = get_delivery_service(store=store).process_cycle(team_slug=record.team_slug, limit=limit)
+    return {"deliveries": results}
+
+
 @app.get("/api/watchlist")
 def list_watchlist_api(request: Request) -> Dict[str, Any]:
     store = get_store()
@@ -1122,6 +1253,10 @@ def dashboard(
             alert_delivery_to_payload(row)
             for row in store.list_alert_deliveries(ownership=ownership, limit=10)
         ],
+        alert_destinations=[
+            alert_destination_to_payload(row)
+            for row in store.list_alert_destinations(ownership=ownership, active_only=True)
+        ],
         watchlist=store.list_repo_watchlists(ownership=ownership),
         team_settings=team_settings_to_payload(team_settings),
         scan_runs=[scan_run_to_payload(row) for row in store.list_scan_runs(ownership=ownership, limit=10)],
@@ -1172,6 +1307,48 @@ def add_watchlist_form(request: Request, repo_name: str = Form(...)) -> Redirect
         store.add_repo_watchlist(ownership=ownership, repo_name=repo_name)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/alert-destinations")
+def add_alert_destination_form(
+    request: Request,
+    name: str = Form(...),
+    kind: str = Form(...),
+    target_url: str = Form(...),
+) -> RedirectResponse:
+    store = get_store()
+    ownership = record_to_ownership(get_authenticated_record(request, store=store))
+    try:
+        store.add_alert_destination(
+            ownership=ownership,
+            name=name,
+            kind=kind,
+            target_url=target_url,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/alert-destinations/{destination_id}/deactivate")
+def deactivate_alert_destination_form(destination_id: int, request: Request) -> RedirectResponse:
+    store = get_store()
+    ownership = record_to_ownership(get_authenticated_record(request, store=store))
+    updated = store.deactivate_alert_destination(ownership=ownership, destination_id=destination_id)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Alert destination not found")
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/alert-destinations/{destination_id}/test")
+def test_alert_destination_form(destination_id: int, request: Request) -> RedirectResponse:
+    store = get_store()
+    ownership = record_to_ownership(get_authenticated_record(request, store=store))
+    try:
+        get_delivery_service(store=store).send_test_alert(ownership=ownership, destination_id=destination_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     return RedirectResponse(url="/", status_code=303)
 
 
@@ -1230,6 +1407,14 @@ def run_scan_cycle_form(request: Request) -> RedirectResponse:
     store = get_store()
     record = get_authenticated_record(request, store=store)
     get_scan_service(store=store).run_cycle(team_slug=record.team_slug)
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/alerts/process-queue")
+def process_alert_queue_form(request: Request) -> RedirectResponse:
+    store = get_store()
+    record = get_authenticated_record(request, store=store)
+    get_delivery_service(store=store).process_cycle(team_slug=record.team_slug, limit=20)
     return RedirectResponse(url="/", status_code=303)
 
 

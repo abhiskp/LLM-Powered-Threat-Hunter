@@ -6,7 +6,7 @@ import tempfile
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -35,6 +35,8 @@ ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")
 ALERT_MIN_RISK = os.getenv("ALERT_MIN_RISK", "high").strip().lower()
 ALERT_MIN_CONFIDENCE = int(os.getenv("ALERT_MIN_CONFIDENCE", "80"))
 SCAN_LOCK_TIMEOUT_MINUTES = int(os.getenv("WATCHMAN_SCAN_LOCK_MINUTES", "30"))
+DELIVERY_RETRY_LIMIT = int(os.getenv("WATCHMAN_DELIVERY_RETRY_LIMIT", "3"))
+DELIVERY_RETRY_BASE_MINUTES = int(os.getenv("WATCHMAN_DELIVERY_RETRY_BASE_MINUTES", "5"))
 DEFAULT_TEAM_SLUG = os.getenv("WATCHMAN_DEFAULT_TEAM_SLUG", "personal-lab")
 DEFAULT_TEAM_NAME = os.getenv("WATCHMAN_DEFAULT_TEAM_NAME", "Personal Lab")
 DEFAULT_USER_EMAIL = os.getenv("WATCHMAN_DEFAULT_USER_EMAIL", "analyst@example.com")
@@ -105,6 +107,37 @@ class ScanExecutionResult:
     findings_created: int = 0
     high_risk_findings: int = 0
     skipped_commits: int = 0
+
+
+def build_slack_webhook_body(payload: Dict[str, Any]) -> Dict[str, Any]:
+    risk = str(payload.get("risk") or "unknown").upper()
+    summary = str(payload.get("summary") or "Suspicious code detected.")
+    repo_name = str(payload.get("repo_name") or "")
+    commit_sha = str(payload.get("commit_sha") or "")
+    file_name = str(payload.get("file_name") or "")
+    confidence = int(payload.get("confidence") or 0)
+    indicators = ", ".join(str(item) for item in payload.get("indicators") or []) or "None"
+    return {
+        "text": f"[{risk}] {repo_name} {file_name}: {summary}",
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*[{risk}] Threat Hunter alert*\n*Repo:* `{repo_name}`\n*File:* `{file_name}`",
+                },
+            },
+            {
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*Confidence*\n{confidence}%"},
+                    {"type": "mrkdwn", "text": f"*Commit*\n`{commit_sha[:12]}`"},
+                ],
+            },
+            {"type": "section", "text": {"type": "mrkdwn", "text": summary}},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"Indicators: {indicators}"}]},
+        ],
+    }
 
 def default_ownership_context(
     team_slug: Optional[str] = None,
@@ -843,6 +876,19 @@ def print_scan_run_report(results: List[Dict[str, Any]]) -> None:
             print(f"       error={result['error_message']}")
 
 
+def print_delivery_report(results: List[Dict[str, Any]]) -> None:
+    if not results:
+        print("No alert deliveries were processed.")
+        return
+    for result in results:
+        status = str(result.get("status", "unknown")).upper()
+        print(f"[{status}] {result.get('team_slug')} {result.get('repo_name')} via {result.get('channel')}")
+        if result.get("error_message"):
+            print(f"       error={result['error_message']}")
+        if result.get("next_attempt_at"):
+            print(f"       next_attempt_at={result['next_attempt_at']}")
+
+
 def resolve_alert_settings(
     ownership: OwnershipContext,
     store: Optional[FindingStore] = None,
@@ -911,6 +957,158 @@ def build_alert_payload(
     }
 
 
+class AlertDeliveryService:
+    def __init__(self, store: Optional[FindingStore] = None) -> None:
+        self.store = store or FindingStore(db_path=DATABASE_PATH, database_url=DATABASE_URL)
+
+    def queue_destinations(
+        self,
+        ownership: OwnershipContext,
+        payload: Dict[str, Any],
+        repo_name: str,
+        commit_sha: str,
+        file_name: str,
+    ) -> List[Dict[str, Any]]:
+        queued: List[Dict[str, Any]] = []
+        for destination in self.store.list_alert_destinations(ownership=ownership, active_only=True):
+            queued.append(
+                self.store.enqueue_alert_delivery(
+                    ownership=ownership,
+                    repo_name=repo_name,
+                    commit_sha=commit_sha,
+                    file_name=file_name,
+                    channel=str(destination["kind"]),
+                    destination=str(destination["target_url"]),
+                    payload=payload,
+                    destination_id=int(destination["id"]),
+                    status="pending",
+                )
+            )
+        return queued
+
+    def process_cycle(self, team_slug: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        for row in self.store.list_pending_alert_deliveries(team_slug=team_slug, limit=limit):
+            results.append(self._process_delivery_row(row))
+        return results
+
+    def send_test_alert(self, ownership: OwnershipContext, destination_id: int) -> Dict[str, Any]:
+        destination = self.store.get_alert_destination(ownership=ownership, destination_id=destination_id)
+        if destination is None:
+            raise ValueError("Alert destination not found.")
+        payload = {
+            "team_slug": ownership.team_slug,
+            "team_name": ownership.team_name,
+            "repo_name": "watchman/system",
+            "commit_sha": "test-alert",
+            "file_name": "system/test",
+            "risk": "high",
+            "confidence": 100,
+            "summary": f"Test alert for destination {destination['name']}",
+            "rule_hits": ["test-alert"],
+            "reasons": ["Manual destination validation"],
+            "indicators": ["test-alert"],
+            "history_context": {},
+            "suppression_context": {},
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        queued = self.store.enqueue_alert_delivery(
+            ownership=ownership,
+            repo_name="watchman/system",
+            commit_sha="test-alert",
+            file_name="system/test",
+            channel=str(destination["kind"]),
+            destination=str(destination["target_url"]),
+            payload=payload,
+            destination_id=int(destination["id"]),
+            status="pending",
+        )
+        row = {
+            **queued,
+            "team_slug": ownership.team_slug,
+            "team_name": ownership.team_name,
+            "payload_json": json.dumps(payload),
+            "destination_kind": destination["kind"],
+            "destination_name": destination["name"],
+            "target_url": destination["target_url"],
+            "attempt_number": 0,
+        }
+        return self._process_delivery_row(row)
+
+    def _process_delivery_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        payload = json.loads(row.get("payload_json") or "{}")
+        delivery_id = int(row["id"])
+        destination_id = row.get("destination_id")
+        try:
+            self._send_destination(row, payload)
+            self.store.update_alert_delivery_status(
+                delivery_id,
+                status="delivered",
+                error_message=None,
+                next_attempt_at=None,
+                increment_attempt=True,
+            )
+            if destination_id:
+                self.store.record_alert_destination_result(int(destination_id), error_message=None)
+            return {
+                "delivery_id": delivery_id,
+                "team_slug": row.get("team_slug"),
+                "repo_name": row.get("repo_name"),
+                "channel": row.get("channel"),
+                "status": "delivered",
+            }
+        except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+            next_attempt_number = int(row.get("attempt_number") or 0) + 1
+            if next_attempt_number >= DELIVERY_RETRY_LIMIT:
+                status = "dead_letter"
+                next_attempt_at = None
+            else:
+                status = "failed"
+                next_attempt_at = self._retry_at(next_attempt_number)
+            self.store.update_alert_delivery_status(
+                delivery_id,
+                status=status,
+                error_message=str(exc),
+                next_attempt_at=next_attempt_at,
+                increment_attempt=True,
+            )
+            if destination_id:
+                self.store.record_alert_destination_result(int(destination_id), error_message=str(exc))
+            return {
+                "delivery_id": delivery_id,
+                "team_slug": row.get("team_slug"),
+                "repo_name": row.get("repo_name"),
+                "channel": row.get("channel"),
+                "status": status,
+                "error_message": str(exc),
+                "next_attempt_at": next_attempt_at,
+            }
+
+    def _send_destination(self, row: Dict[str, Any], payload: Dict[str, Any]) -> None:
+        kind = str(row.get("destination_kind") or row.get("channel") or "").strip().lower()
+        target_url = str(row.get("target_url") or row.get("destination") or "").strip()
+        if kind == "slack_webhook":
+            self._send_json(target_url, build_slack_webhook_body(payload))
+            return
+        raise ValueError(f"Unsupported destination kind: {kind}")
+
+    @staticmethod
+    def _send_json(target_url: str, payload: Dict[str, Any]) -> None:
+        request = urllib.request.Request(
+            target_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            response.read()
+
+    @staticmethod
+    def _retry_at(attempt_number: int) -> str:
+        delay_minutes = DELIVERY_RETRY_BASE_MINUTES * (2 ** max(0, attempt_number - 1))
+        return (datetime.now(timezone.utc) + timedelta(minutes=delay_minutes)).isoformat()
+
+
 def deliver_alert(
     ownership: OwnershipContext,
     repo_name: str,
@@ -943,8 +1141,25 @@ def deliver_alert(
             status="delivered",
         )
 
+    if store is not None:
+        delivery_service = AlertDeliveryService(store=store)
+        queued = delivery_service.queue_destinations(
+            ownership=ownership,
+            payload=payload,
+            repo_name=repo_name,
+            commit_sha=commit_sha,
+            file_name=file_name,
+        )
+        if queued:
+            processed = delivery_service.process_cycle(team_slug=ownership.team_slug, limit=max(len(queued), 1))
+            for row in processed:
+                if row.get("status") == "delivered":
+                    channels.append(str(row.get("channel") or "destination"))
+                elif row.get("error_message"):
+                    errors.append(str(row["error_message"]))
+
     webhook_url = effective_settings.get("alert_webhook_url") or ALERT_WEBHOOK_URL
-    if webhook_url:
+    if webhook_url and store is None:
         request = urllib.request.Request(
             str(webhook_url),
             data=json.dumps(payload).encode("utf-8"),
@@ -955,29 +1170,40 @@ def deliver_alert(
             with urllib.request.urlopen(request, timeout=10) as response:
                 response.read()
             channels.append("webhook")
-            if store is not None:
-                store.record_alert_delivery(
-                    ownership=ownership,
-                    repo_name=repo_name,
-                    commit_sha=commit_sha,
-                    file_name=file_name,
-                    channel="webhook",
-                    destination=str(webhook_url),
-                    status="delivered",
-                )
         except (urllib.error.URLError, TimeoutError, ValueError) as exc:
             errors.append(f"webhook failed: {exc}")
-            if store is not None:
-                store.record_alert_delivery(
-                    ownership=ownership,
-                    repo_name=repo_name,
-                    commit_sha=commit_sha,
-                    file_name=file_name,
-                    channel="webhook",
-                    destination=str(webhook_url),
-                    status="failed",
-                    error_message=str(exc),
-                )
+    elif webhook_url and store is not None and not store.list_alert_destinations(ownership=ownership, active_only=True):
+        request = urllib.request.Request(
+            str(webhook_url),
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                response.read()
+            channels.append("webhook")
+            store.record_alert_delivery(
+                ownership=ownership,
+                repo_name=repo_name,
+                commit_sha=commit_sha,
+                file_name=file_name,
+                channel="webhook",
+                destination=str(webhook_url),
+                status="delivered",
+            )
+        except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+            errors.append(f"webhook failed: {exc}")
+            store.record_alert_delivery(
+                ownership=ownership,
+                repo_name=repo_name,
+                commit_sha=commit_sha,
+                file_name=file_name,
+                channel="webhook",
+                destination=str(webhook_url),
+                status="failed",
+                error_message=str(exc),
+            )
 
     return AlertDeliveryResult(delivered=bool(channels), channels=channels, errors=errors)
 
@@ -1236,6 +1462,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the scan cycle for every team with active watchlists",
     )
 
+    delivery_worker_parser = subparsers.add_parser(
+        "run-delivery-worker",
+        help="Process pending alert deliveries for configured destinations",
+    )
+    delivery_worker_parser.add_argument(
+        "--all-teams",
+        action="store_true",
+        help="Process the delivery queue for every team",
+    )
+
     return parser
 
 
@@ -1378,6 +1614,12 @@ def main() -> None:
         service = BackgroundScanService()
         results = service.run_cycle(team_slug=None if args.all_teams else ownership.team_slug)
         print_scan_run_report(results)
+        return
+
+    if args.command == "run-delivery-worker":
+        service = AlertDeliveryService(store=store)
+        results = service.process_cycle(team_slug=None if args.all_teams else ownership.team_slug, limit=50)
+        print_delivery_report(results)
         return
 
     parser.error(f"Unsupported command: {args.command}")

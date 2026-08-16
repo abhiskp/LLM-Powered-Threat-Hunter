@@ -190,7 +190,60 @@ def test_settings_and_scan_run_endpoints(tmp_path: Path, monkeypatch) -> None:
                     }
                 ]
 
+        class FakeDeliveryService:
+            def __init__(self, store=None):
+                self.store = store
+
+            def send_test_alert(self, ownership, destination_id):
+                return {
+                    "delivery_id": 77,
+                    "team_slug": ownership.team_slug,
+                    "repo_name": "watchman/system",
+                    "channel": "slack_webhook",
+                    "status": "delivered",
+                }
+
+            def process_cycle(self, team_slug=None, limit=20):
+                return [
+                    {
+                        "delivery_id": 77,
+                        "team_slug": team_slug or "delta",
+                        "repo_name": "watchman/system",
+                        "channel": "slack_webhook",
+                        "status": "delivered",
+                    }
+                ]
+
         monkeypatch.setattr(threat_app, "get_scan_service", lambda store=None: FakeScanService(store=store))
+        monkeypatch.setattr(
+            threat_app,
+            "get_delivery_service",
+            lambda store=None: FakeDeliveryService(store=store),
+        )
+
+        destination = client.post(
+            "/api/alert-destinations",
+            data={
+                "name": "Primary Slack",
+                "kind": "slack_webhook",
+                "target_url": "https://hooks.slack.com/services/T000/B000/XXX",
+            },
+        )
+        assert destination.status_code == 200
+        destination_payload = destination.json()["alert_destination"]
+        assert destination_payload["name"] == "Primary Slack"
+
+        listed_destinations = client.get("/api/alert-destinations")
+        assert listed_destinations.status_code == 200
+        assert listed_destinations.json()["alert_destinations"][0]["kind"] == "slack_webhook"
+
+        tested_destination = client.post(f"/api/alert-destinations/{destination_payload['id']}/test")
+        assert tested_destination.status_code == 200
+        assert tested_destination.json()["delivery"]["status"] == "delivered"
+
+        processed_queue = client.post("/api/alerts/process-queue")
+        assert processed_queue.status_code == 200
+        assert processed_queue.json()["deliveries"][0]["status"] == "delivered"
 
         watchlist = client.get("/api/watchlist").json()["watchlist"]
         scan_now = client.post(f"/api/watchlist/{watchlist[0]['id']}/scan-now")
