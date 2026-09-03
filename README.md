@@ -70,6 +70,7 @@ WATCHMAN_DEFAULT_TEAM_NAME=Personal Lab
 WATCHMAN_DEFAULT_USER_EMAIL=analyst@example.com
 WATCHMAN_DEFAULT_USER_NAME=Local Analyst
 WATCHMAN_SESSION_SECRET=change-me-in-production
+GITHUB_WEBHOOK_SECRET=replace-with-a-long-random-secret
 ```
 
 Use `WATCHMAN_DB_PATH` for local SQLite or set `WATCHMAN_DATABASE_URL` for PostgreSQL:
@@ -95,6 +96,17 @@ uvicorn app:app --reload
 Open `http://127.0.0.1:8000` to review findings in the browser.
 
 The web app now uses signed session cookies. Start by creating a team workspace from `/login`, then sign in and onboard watched repos from the dashboard.
+
+## GitHub Push Integration
+
+The app can receive GitHub `push` webhooks and start the existing team-scoped scan workflow automatically. GitHub notifies the service, the service verifies the event, then it scans only repositories already added to an active team watchlist.
+
+1. Generate a long random value and set it as `GITHUB_WEBHOOK_SECRET` in the service environment.
+2. Deploy the FastAPI app at a public HTTPS URL.
+3. In the GitHub repository webhook settings, create a webhook pointing to `https://your-service.example/api/integrations/github/webhook`.
+4. Set the webhook content type to `application/json`, use the same secret, and subscribe to **Just the push event**.
+
+The endpoint validates GitHub's `X-Hub-Signature-256` signature, ignores non-push events, and rejects repositories that are not on an active watchlist. A valid event returns `202 Accepted` while the scan proceeds through the normal scan-run and finding persistence path.
 
 Run the background scan worker for the current team:
 
@@ -154,6 +166,7 @@ The repo now includes a product-facing FastAPI service:
 - `POST /auth/register`
 - `POST /auth/login`
 - `POST /auth/logout`
+- `POST /api/integrations/github/webhook`
 - `GET /api/session`
 - `GET /api/findings`
 - `GET /api/findings/{id}`

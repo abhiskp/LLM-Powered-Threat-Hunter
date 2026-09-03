@@ -1,3 +1,6 @@
+import hashlib
+import hmac
+import json
 from pathlib import Path
 
 import app as threat_app
@@ -298,6 +301,65 @@ def test_login_and_logout_cycle(tmp_path: Path) -> None:
         logout = client.post("/auth/logout", follow_redirects=False)
         assert logout.status_code == 303
         assert client.get("/api/session").status_code == 401
+    finally:
+        watchman.DATABASE_PATH = original_db
+        watchman.ALERTS_LOG_PATH = original_alert_path
+        threat_app.DATABASE_PATH = original_app_db
+        threat_app.ALERTS_LOG_PATH = original_app_alert
+
+
+def test_github_push_webhook_requires_a_valid_signature_and_queues_watchlist_scan(
+    tmp_path: Path, monkeypatch
+) -> None:
+    db_path = tmp_path / "github-webhook.db"
+    alert_path = tmp_path / "alerts.jsonl"
+    original_db = watchman.DATABASE_PATH
+    original_alert_path = watchman.ALERTS_LOG_PATH
+    original_app_db = threat_app.DATABASE_PATH
+    original_app_alert = threat_app.ALERTS_LOG_PATH
+    try:
+        watchman.DATABASE_PATH = db_path
+        watchman.ALERTS_LOG_PATH = alert_path
+        threat_app.DATABASE_PATH = db_path
+        threat_app.ALERTS_LOG_PATH = alert_path
+        monkeypatch.setattr(threat_app, "GITHUB_WEBHOOK_SECRET", "webhook-test-secret")
+
+        queued_targets = []
+
+        class FakeScanService:
+            def __init__(self, store=None):
+                self.store = store
+
+            def scan_target(self, target, trigger_mode):
+                queued_targets.append((target["repo_name"], trigger_mode))
+                return {"status": "completed"}
+
+        monkeypatch.setattr(threat_app, "get_scan_service", lambda store=None: FakeScanService(store=store))
+
+        client = TestClient(threat_app.app)
+        register_team(client, "gamma", "Gamma Team", "gamma@example.com", "Gia")
+        payload = json.dumps({"repository": {"full_name": "psf/requests"}}).encode("utf-8")
+        signature = "sha256=" + hmac.new(
+            b"webhook-test-secret", payload, hashlib.sha256
+        ).hexdigest()
+
+        rejected = client.post(
+            "/api/integrations/github/webhook",
+            content=payload,
+            headers={"x-github-event": "push", "x-hub-signature-256": "sha256=invalid"},
+        )
+        assert rejected.status_code == 401
+        assert queued_targets == []
+
+        accepted = client.post(
+            "/api/integrations/github/webhook",
+            content=payload,
+            headers={"x-github-event": "push", "x-hub-signature-256": signature},
+        )
+        assert accepted.status_code == 202
+        assert accepted.json()["repo_name"] == "psf/requests"
+        assert accepted.json()["team_count"] == 1
+        assert queued_targets == [("psf/requests", "github_push")]
     finally:
         watchman.DATABASE_PATH = original_db
         watchman.ALERTS_LOG_PATH = original_alert_path

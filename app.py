@@ -1,9 +1,12 @@
 import json
+import hashlib
+import hmac
+import os
 from datetime import datetime, timezone
 from html import escape
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from auth import SESSION_COOKIE_NAME, SESSION_MAX_AGE_SECONDS, create_session_cookie, parse_session_cookie
@@ -28,6 +31,8 @@ from watchman import (
 
 app = FastAPI(title="Threat Hunter Analyst Inbox", version="0.2.0")
 
+GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET", "")
+
 
 def get_store() -> FindingStore:
     return FindingStore(db_path=DATABASE_PATH, database_url=DATABASE_URL)
@@ -39,6 +44,21 @@ def get_scan_service(store: Optional[FindingStore] = None) -> BackgroundScanServ
 
 def get_delivery_service(store: Optional[FindingStore] = None) -> AlertDeliveryService:
     return AlertDeliveryService(store=store or get_store())
+
+
+def verify_github_webhook_signature(payload: bytes, signature: Optional[str]) -> bool:
+    """Verify GitHub's SHA-256 HMAC before accepting an unauthenticated event."""
+    if not GITHUB_WEBHOOK_SECRET or not signature:
+        return False
+    expected = "sha256=" + hmac.new(
+        GITHUB_WEBHOOK_SECRET.encode("utf-8"), payload, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+def process_github_push(store: FindingStore, target: Dict[str, Any]) -> Dict[str, Any]:
+    """Reuse the scheduled scanner so push and scheduled scans share persistence rules."""
+    return get_scan_service(store=store).scan_target(target, trigger_mode="github_push")
 
 
 def record_to_ownership(record: OwnershipRecord) -> OwnershipContext:
@@ -837,6 +857,46 @@ def authenticated_redirect() -> RedirectResponse:
 @app.get("/health")
 def health() -> Dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/api/integrations/github/webhook", status_code=202)
+async def github_webhook(request: Request, background_tasks: BackgroundTasks) -> Dict[str, Any]:
+    """Accept verified GitHub push events for repositories a team has explicitly watched."""
+    if not GITHUB_WEBHOOK_SECRET:
+        raise HTTPException(status_code=503, detail="GitHub webhook integration is not configured")
+
+    raw_body = await request.body()
+    if not verify_github_webhook_signature(raw_body, request.headers.get("x-hub-signature-256")):
+        raise HTTPException(status_code=401, detail="Invalid GitHub webhook signature")
+
+    event_name = request.headers.get("x-github-event", "")
+    if event_name != "push":
+        return {"status": "ignored", "reason": f"Unsupported GitHub event: {event_name or 'unknown'}"}
+
+    try:
+        event = json.loads(raw_body)
+        repo_name = str(event["repository"]["full_name"]).strip()
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="Malformed GitHub push payload") from exc
+
+    store = get_store()
+    targets = [
+        target
+        for target in store.list_scan_targets()
+        if str(target["repo_name"]).lower() == repo_name.lower()
+    ]
+    if not targets:
+        raise HTTPException(status_code=404, detail="Repository is not in an active team watchlist")
+
+    for target in targets:
+        background_tasks.add_task(process_github_push, store, target)
+
+    return {
+        "status": "accepted",
+        "event": "push",
+        "repo_name": repo_name,
+        "team_count": len(targets),
+    }
 
 
 @app.get("/login", response_class=HTMLResponse)
